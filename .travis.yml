@@ -52,7 +52,6 @@ cache:
   ccache:
 
 script:
-  - bash autogen.sh
   - CC=$COMPILER ./configure
   - make -j4
   - make install
