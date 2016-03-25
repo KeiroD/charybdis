@@ -56,3 +56,16 @@ script:
   - CC=$COMPILER ./configure
   - make -j4
   - make install
+
+
+
+notifications:
+  irc:
+  - "irc.darkmyst.org#coding"
+
+# whitelist
+branches:
+  only:
+    - master
+    - release/3.4
+    - release/3.5
