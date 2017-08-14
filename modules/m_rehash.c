@@ -44,6 +44,7 @@
 #include "reject.h"
 #include "hash.h"
 #include "cache.h"
+#include "sslproc.h"
 
 static int mo_rehash(struct Client *, struct Client *, int, const char **);
 static int me_rehash(struct Client *, struct Client *, int, const char **);
@@ -83,6 +84,22 @@ rehash_dns(struct Client *source_p)
 
 	/* reread /etc/resolv.conf and reopen res socket */
 	restart_resolver();
+}
+
+static void
+rehash_ssld(struct Client *source_p)
+{
+	if (!IsOperAdmin(source_p))
+	{
+		sendto_one(source_p, form_str(ERR_NOPRIVS),
+			   me.name, source_p->name, "admin");
+		return;
+	}
+
+	sendto_realops_snomask(SNO_GENERAL, L_ALL, "%s is restarting ssld",
+				get_oper_name(source_p));
+
+	restart_ssld();
 }
 
 static void
@@ -278,6 +295,7 @@ static struct hash_commands rehash_commands[] =
 {
 	{"BANS",	rehash_bans_loc		},
 	{"DNS", 	rehash_dns		},
+	{"SSLD", 	rehash_ssld		},
 	{"MOTD", 	rehash_motd		},
 	{"OMOTD", 	rehash_omotd		},
 	{"TKLINES", 	rehash_tklines		},
@@ -359,13 +377,25 @@ mo_rehash(struct Client *client_p, struct Client *source_p, int parc, const char
 	}
 
 	if (parc > 2)
-		type = parv[1], target_server = parv[2];
+	{
+		type = parv[1];
+		target_server = parv[2];
+	}
 	else if (parc > 1 && (strchr(parv[1], '.') || strchr(parv[1], '?') || strchr(parv[1], '*')))
-		type = NULL, target_server = parv[1];
+	{
+		type = NULL;
+		target_server = parv[1];
+	}
 	else if (parc > 1)
-		type = parv[1], target_server = NULL;
+	{
+		type = parv[1];
+		target_server = NULL;
+	}
 	else
-		type = NULL, target_server = NULL;
+	{
+		type = NULL;
+		target_server = NULL;
+	}
 
 	if (target_server != NULL)
 	{

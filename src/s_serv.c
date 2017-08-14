@@ -255,7 +255,7 @@ try_connections(void *unused)
 			continue;
 
 		/* don't allow ssl connections if ssl isn't setup */
-		if(ServerConfSSL(tmp_p) && (!ssl_ok || !get_ssld_count()))
+		if(ServerConfSSL(tmp_p) && (!ircd_ssl_ok || !get_ssld_count()))
 			continue;
 
 		cltmp = tmp_p->class;
@@ -330,6 +330,9 @@ check_server(const char *name, struct Client *client_p)
 	rb_dlink_node *ptr;
 	int error = -1;
 	const char *encr;
+	int name_matched = 0;
+	int host_matched = 0;
+	int certfp_failed = 0;
 
 	s_assert(NULL != client_p);
 	if(client_p == NULL)
@@ -351,14 +354,14 @@ check_server(const char *name, struct Client *client_p)
 		if(!match(tmp_p->name, name))
 			continue;
 
-		error = -3;
+		name_matched = 1;
 
 		/* XXX: Fix me for IPv6 */
 		/* XXX sockhost is the IPv4 ip as a string */
 		if(match(tmp_p->host, client_p->host) ||
 		   match(tmp_p->host, client_p->sockhost))
 		{
-			error = -2;
+			host_matched = 1;
 
 			if(tmp_p->passwd)
 			{
@@ -380,8 +383,10 @@ check_server(const char *name, struct Client *client_p)
 
 			if(tmp_p->certfp)
 			{
-				if(!client_p->certfp || strcasecmp(tmp_p->certfp, client_p->certfp) != 0)
+				if(!client_p->certfp || strcasecmp(tmp_p->certfp, client_p->certfp) != 0) {
+					certfp_failed = 1;
 					continue;
+				}
 			}
 
 			server_p = tmp_p;
@@ -390,7 +395,17 @@ check_server(const char *name, struct Client *client_p)
 	}
 
 	if(server_p == NULL)
+	{
+		/* return the most specific error */
+		if(certfp_failed)
+			error = -6;
+		else if(host_matched)
+			error = -2;
+		else if(name_matched)
+			error = -3;
+
 		return error;
+	}
 
 	if(ServerConfSSL(server_p) && client_p->localClient->ssl_ctl == NULL)
 	{
@@ -800,7 +815,7 @@ server_estab(struct Client *client_p)
 			   EmptyString(server_p->spasswd) ? "*" : server_p->spasswd, TS_CURRENT, me.id);
 
 		/* pass info to new server */
-		send_capabilities(client_p, default_server_capabs
+		send_capabilities(client_p, default_server_capabs | CAP_MASK
 				  | (ServerConfCompressed(server_p) ? CAP_ZIP_SUPPORTED : 0)
 				  | (ServerConfTb(server_p) ? CAP_TB : 0));
 
@@ -818,12 +833,13 @@ server_estab(struct Client *client_p)
 	{
 		start_zlib_session(client_p);
 	}
-	sendto_one(client_p, "SVINFO %d %d 0 :%ld", TS_CURRENT, TS_MIN, (long int)rb_current_time());
 
 	client_p->servptr = &me;
 
 	if(IsAnyDead(client_p))
 		return CLIENT_EXITED;
+
+	sendto_one(client_p, "SVINFO %d %d 0 :%ld", TS_CURRENT, TS_MIN, (long int)rb_current_time());
 
 	SetServer(client_p);
 
@@ -1263,11 +1279,9 @@ serv_connect_ssl_callback(rb_fde_t *F, int status, void *data)
 		return;
 
 	}
-	del_from_cli_connid_hash(client_p);
 	client_p->localClient->F = xF[0];
-	add_to_cli_connid_hash(client_p);
+	client_p->localClient->ssl_ctl = start_ssld_connect(F, xF[1], client_p->localClient->connid);
 
-	client_p->localClient->ssl_ctl = start_ssld_connect(F, xF[1], rb_get_fd(xF[0]));
 	SetSSL(client_p);
 	serv_connect_callback(client_p->localClient->F, RB_OK, client_p);
 }
@@ -1359,7 +1373,7 @@ serv_connect_callback(rb_fde_t *F, int status, void *data)
 		   EmptyString(server_p->spasswd) ? "*" : server_p->spasswd, TS_CURRENT, me.id);
 
 	/* pass my info to the new server */
-	send_capabilities(client_p, default_server_capabs
+	send_capabilities(client_p, default_server_capabs | CAP_MASK
 			  | (ServerConfCompressed(server_p) ? CAP_ZIP_SUPPORTED : 0)
 			  | (ServerConfTb(server_p) ? CAP_TB : 0));
 

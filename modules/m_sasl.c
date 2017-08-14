@@ -91,6 +91,12 @@ m_authenticate(struct Client *client_p, struct Client *source_p,
 		return 0;
 	}
 
+	if (*parv[1] == ':' || strchr(parv[1], ' '))
+	{
+		exit_client(client_p, client_p, client_p, "Malformed AUTHENTICATE");
+		return 0;
+	}
+
 	saslserv_p = find_named_client(ConfigFileEntry.sasl_service);
 	if (saslserv_p == NULL || !IsService(saslserv_p))
 	{
@@ -122,9 +128,10 @@ m_authenticate(struct Client *client_p, struct Client *source_p,
 
 	if(agent_p == NULL)
 	{
-		sendto_one(saslserv_p, ":%s ENCAP %s SASL %s %s H %s %s",
+		sendto_one(saslserv_p, ":%s ENCAP %s SASL %s %s H %s %s %c",
 					me.id, saslserv_p->servptr->name, source_p->id, saslserv_p->id,
-					source_p->host, source_p->sockhost);
+					source_p->host, source_p->sockhost,
+					IsSSL(source_p) ? 'S' : 'P');
 
 		if (!strcmp(parv[1], "EXTERNAL") && source_p->certfp != NULL)
 			sendto_one(saslserv_p, ":%s ENCAP %s SASL %s %s S %s %s",

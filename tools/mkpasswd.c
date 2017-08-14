@@ -49,8 +49,8 @@ static char *int_to_base64(int);
 static char *generate_random_salt(char *, int);
 static char *generate_poor_salt(char *, int);
 
-static void full_usage(void);
-static void brief_usage(void);
+static void full_usage(void) __attribute__((noreturn));
+static void brief_usage(void) __attribute__((noreturn));
 
 static char saltChars[] = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
        /* 0 .. 63, ascii - 64 */
@@ -98,7 +98,7 @@ main(int argc, char *argv[])
 	int c;
 	char *saltpara = NULL;
 	char *salt;
-	char *hashed;
+	char *hashed, *hashed2;
 	int flag = 0;
 	int length = 0;		/* Not Set */
 	int rounds = 0;		/* Not set, since extended DES needs 25 and blowfish needs
@@ -150,11 +150,9 @@ main(int argc, char *argv[])
 		case 'h':
 			full_usage();
 			/* NOT REACHED */
-			break;
 		case '?':
 			brief_usage();
 			/* NOT REACHED */
-			break;
 		default:
 			printf("Invalid Option: -%c\n", c);
 			break;
@@ -249,10 +247,24 @@ main(int argc, char *argv[])
 	}
 	else
 	{
-		hashed = strdup(rb_crypt(getpass("plaintext: "), salt));
-		plaintext = getpass("again: ");
+		plaintext = getpass("plaintext: ");
+		hashed = rb_crypt(plaintext, salt);
+		if (!hashed)
+		{
+			fprintf(stderr, "rb_crypt() failed\n");
+			return 1;
+		}
+		hashed = strdup(hashed);
 
-		if (strcmp(rb_crypt(plaintext, salt), hashed) != 0)
+		plaintext = getpass("again: ");
+		hashed2 = rb_crypt(plaintext, salt);
+		if (!hashed2)
+		{
+			fprintf(stderr, "rb_crypt() failed\n");
+			return 1;
+		}
+
+		if (strcmp(hashed, hashed2) != 0)
 		{
 			fprintf(stderr, "Passwords do not match\n");
 			return 1;
@@ -497,7 +509,7 @@ generate_random_salt(char *salt, int length)
 	return (salt);
 }
 
-void
+static void
 full_usage()
 {
 	printf("mkpasswd [-m|-d|-b|-e] [-l saltlength] [-r rounds] [-s salt] [-p plaintext]\n");
@@ -518,7 +530,7 @@ full_usage()
 	exit(0);
 }
 
-void
+static void
 brief_usage()
 {
 	printf("mkpasswd - password hash generator\n");

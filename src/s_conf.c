@@ -58,7 +58,7 @@
 struct config_server_hide ConfigServerHide;
 
 extern int yyparse(void);		/* defined in y.tab.c */
-extern char linebuf[];
+extern char yy_linebuf[16384];		/* defined in ircd_lexer.l */
 
 #ifndef INADDR_NONE
 #define INADDR_NONE ((unsigned int) 0xffffffff)
@@ -822,7 +822,7 @@ set_default_conf(void)
 	ServerInfo.default_max_clients = MAXCONNECTIONS;
 
 	ConfigFileEntry.nicklen = NICKLEN;
-	ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA1;
+	ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA1;
 
 	if (!alias_dict)
 		alias_dict = irc_dictionary_create(strcasecmp);
@@ -874,10 +874,10 @@ validate_conf(void)
 	if(!rb_setup_ssl_server(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list))
 	{
 		ilog(L_MAIN, "WARNING: Unable to setup SSL.");
-		ssl_ok = 0;
+		ircd_ssl_ok = 0;
 	} else {
-		ssl_ok = 1;
-		send_new_ssl_certs(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+		ircd_ssl_ok = 1;
+		send_new_ssl_certs(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list, ConfigFileEntry.certfp_method);
 	}
 
 	if(ServerInfo.ssld_count > get_ssld_count())
@@ -1616,15 +1616,15 @@ conf_add_d_conf(struct ConfItem *aconf)
 	}
 }
 
-static char *
-strip_tabs(char *dest, const char *src, size_t len)
+static void
+strip_tabs(char *dest, const char *src, size_t size)
 {
 	char *d = dest;
 
 	if(dest == NULL || src == NULL)
-		return NULL;
+		return;
 
-	rb_strlcpy(dest, src, len);
+	rb_strlcpy(dest, src, size);
 
 	while(*d)
 	{
@@ -1632,7 +1632,6 @@ strip_tabs(char *dest, const char *src, size_t len)
 			*d = ' ';
 		d++;
 	}
-	return dest;
 }
 
 /*
@@ -1647,7 +1646,7 @@ yyerror(const char *msg)
 {
 	char newlinebuf[BUFSIZE];
 
-	strip_tabs(newlinebuf, linebuf, strlen(linebuf));
+	strip_tabs(newlinebuf, yy_linebuf, sizeof(newlinebuf));
 
 	ierror("\"%s\", line %d: %s at '%s'", conffilebuf, lineno + 1, msg, newlinebuf);
 	sendto_realops_snomask(SNO_GENERAL, L_ALL, "\"%s\", line %d: %s at '%s'",
