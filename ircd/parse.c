@@ -48,7 +48,6 @@ static void cancel_clients(struct Client *, struct Client *);
 static void remove_unknown(struct Client *, const char *, char *);
 
 static void do_numeric(int, struct Client *, struct Client *, int, const char **);
-static void do_alias(struct alias_entry *, struct Client *, char *);
 
 static int handle_command(struct Message *, struct MsgBuf *, struct Client *, struct Client *);
 
@@ -137,24 +136,6 @@ parse(struct Client *client_p, char *pbuffer, char *bufend)
 		/* no command or its encap only, error */
 		if(!mptr || !mptr->cmd)
 		{
-			if (IsPerson(client_p))
-			{
-				struct alias_entry *aptr = rb_dictionary_retrieve(alias_dict, msgbuf.cmd);
-				if (aptr != NULL)
-				{
-					if (msgbuf.n_para < 2)
-					{
-						sendto_one(client_p, form_str(ERR_NEEDMOREPARAMS),
-							   me.name,
-							   EmptyString(client_p->name) ? "*" : client_p->name,
-							   msgbuf.cmd);
-						return;
-					}
-
-					do_alias(aptr, client_p, reconstruct_parv(msgbuf.n_para - 1, msgbuf.para + 1));
-					return;
-				}
-			}
 			if(IsPerson(from))
 			{
 				sendto_one(from, form_str(ERR_UNKNOWNCOMMAND),
@@ -163,8 +144,6 @@ parse(struct Client *client_p, char *pbuffer, char *bufend)
 			ServerStats.is_unco++;
 			return;
 		}
-
-		mptr->bytes += msgbuf.parselen;
 	}
 
 	if(mptr == NULL)
@@ -295,7 +274,7 @@ handle_encap(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *so
 void
 clear_hash_parse()
 {
-	cmd_dict = rb_dictionary_create("command", strcasecmp);
+	cmd_dict = rb_dictionary_create("command", rb_strcasecmp);
 }
 
 /* mod_add_cmd
@@ -314,8 +293,11 @@ mod_add_cmd(struct Message *msg)
 	if(msg == NULL)
 		return;
 
-	if (rb_dictionary_find(cmd_dict, msg->cmd) != NULL)
+	if (rb_dictionary_find(cmd_dict, msg->cmd) != NULL) {
+		ilog(L_MAIN, "Add command: %s already exists", msg->cmd);
+		s_assert(0);
 		return;
+	}
 
 	msg->count = 0;
 	msg->rcount = 0;
@@ -337,7 +319,10 @@ mod_del_cmd(struct Message *msg)
 	if(msg == NULL)
 		return;
 
-	rb_dictionary_delete(cmd_dict, msg->cmd);
+	if (rb_dictionary_delete(cmd_dict, msg->cmd) == NULL) {
+		ilog(L_MAIN, "Delete command: %s not found", msg->cmd);
+		s_assert(0);
+	}
 }
 
 /* cancel_clients()
@@ -525,53 +510,6 @@ do_numeric(int numeric, struct Client *client_p, struct Client *source_p, int pa
 				     numeric, chptr->chname, buffer);
 }
 
-static void do_alias(struct alias_entry *aptr, struct Client *source_p, char *text)
-{
-	char *p;
-	struct Client *target_p;
-
-	if (!IsFloodDone(source_p) && source_p->localClient->receiveM > 20)
-		flood_endgrace(source_p);
-
-	p = strchr(aptr->target, '@');
-	if (p != NULL)
-	{
-		/* user@server */
-		target_p = find_server(NULL, p + 1);
-		if (target_p != NULL && IsMe(target_p))
-			target_p = NULL;
-	}
-	else
-	{
-		/* nick, must be +S */
-		target_p = find_named_person(aptr->target);
-		if (target_p != NULL && !IsService(target_p))
-			target_p = NULL;
-	}
-
-	if (target_p == NULL)
-	{
-		sendto_one_numeric(source_p, ERR_SERVICESDOWN, form_str(ERR_SERVICESDOWN), aptr->target);
-		return;
-	}
-
-	if (text != NULL && *text == ':')
-		text++;
-	if (text == NULL || *text == '\0')
-	{
-		sendto_one(source_p, form_str(ERR_NOTEXTTOSEND), me.name, source_p->name);
-		return;
-	}
-
-	/* increment the hitcounter on this alias */
-	aptr->hits++;
-
-	sendto_one(target_p, ":%s PRIVMSG %s :%s",
-			get_id(source_p, target_p),
-			p != NULL ? aptr->target : get_id(target_p, target_p),
-			text);
-}
-
 void
 m_not_oper(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *source_p, int parc, const char *parv[])
 {
@@ -581,6 +519,9 @@ m_not_oper(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sour
 void
 m_unregistered(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *source_p, int parc, const char *parv[])
 {
+	if(IsAnyServer(client_p))
+		return;
+
 	/* bit of a hack.
 	 * I don't =really= want to waste a bit in a flag
 	 * number_of_nick_changes is only really valid after the client

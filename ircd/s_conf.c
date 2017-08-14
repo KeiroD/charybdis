@@ -43,24 +43,21 @@
 #include "send.h"
 #include "reject.h"
 #include "cache.h"
-#include "blacklist.h"
 #include "privilege.h"
 #include "sslproc.h"
+#include "wsproc.h"
 #include "bandbi.h"
 #include "operhash.h"
 #include "chmode.h"
 #include "hook.h"
 #include "s_assert.h"
-#include "authd.h"
+#include "authproc.h"
+#include "supported.h"
 
 struct config_server_hide ConfigServerHide;
 
 extern int yyparse(void);		/* defined in y.tab.c */
-extern char linebuf[];
-
-#ifndef INADDR_NONE
-#define INADDR_NONE ((unsigned int) 0xffffffff)
-#endif
+extern char yy_linebuf[16384];		/* defined in ircd_lexer.l */
 
 static rb_bh *confitem_heap = NULL;
 
@@ -259,12 +256,7 @@ check_client(struct Client *client_p, struct Client *source_p, const char *usern
 	case NOT_AUTHORISED:
 		{
 			int port = -1;
-#ifdef RB_IPV6
-			if(GET_SS_FAMILY(&source_p->localClient->ip) == AF_INET6)
-				port = ntohs(((struct sockaddr_in6 *)&source_p->localClient->listener->addr)->sin6_port);
-			else
-#endif
-				port = ntohs(((struct sockaddr_in *)&source_p->localClient->listener->addr)->sin_port);
+			port = ntohs(GET_SS_PORT(&source_p->localClient->listener->addr));
 
 			ServerStats.is_ref++;
 			/* jdc - lists server name & port connections are on */
@@ -598,11 +590,11 @@ attach_conf(struct Client *client_p, struct ConfItem *aconf)
 	if(IsIllegal(aconf))
 		return (NOT_AUTHORISED);
 
-	if(ClassPtr(aconf))
-	{
-		if(!add_ip_limit(client_p, aconf))
-			return (TOO_MANY_LOCAL);
-	}
+	if(s_assert(ClassPtr(aconf)))
+		return (NOT_AUTHORISED);
+
+	if(!add_ip_limit(client_p, aconf))
+		return (TOO_MANY_LOCAL);
 
 	if((aconf->status & CONF_CLIENT) &&
 	   ConfCurrUsers(aconf) >= ConfMaxUsers(aconf) && ConfMaxUsers(aconf) > 0)
@@ -638,13 +630,14 @@ attach_conf(struct Client *client_p, struct ConfItem *aconf)
 bool
 rehash(bool sig)
 {
+	hook_data_rehash hdata = { sig };
+
 	if(sig)
-	{
 		sendto_realops_snomask(SNO_GENERAL, L_ALL,
 				     "Got signal SIGHUP, reloading ircd conf. file");
-	}
 
 	rehash_authd();
+
 	/* don't close listeners until we know we can go ahead with the rehash */
 	read_conf_files(false);
 
@@ -654,6 +647,8 @@ rehash(bool sig)
 		rb_strlcpy(me.info, "unknown", sizeof(me.info));
 
 	open_logfiles();
+
+	call_hook(h_rehash, &hdata);
 	return false;
 }
 
@@ -682,11 +677,11 @@ set_default_conf(void)
 	ServerInfo.description = NULL;
 	ServerInfo.network_name = NULL;
 
-	memset(&ServerInfo.ip, 0, sizeof(ServerInfo.ip));
-	ServerInfo.specific_ipv4_vhost = 0;
+	memset(&ServerInfo.bind4, 0, sizeof(ServerInfo.bind4));
+	SET_SS_FAMILY(&ServerInfo.bind4, AF_UNSPEC);
 #ifdef RB_IPV6
-	memset(&ServerInfo.ip6, 0, sizeof(ServerInfo.ip6));
-	ServerInfo.specific_ipv6_vhost = 0;
+	memset(&ServerInfo.bind6, 0, sizeof(ServerInfo.bind6));
+	SET_SS_FAMILY(&ServerInfo.bind6, AF_UNSPEC);
 #endif
 
 	AdminInfo.name = NULL;
@@ -815,11 +810,11 @@ set_default_conf(void)
 	ServerInfo.default_max_clients = MAXCONNECTIONS;
 
 	ConfigFileEntry.nicklen = NICKLEN;
-	ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA1;
+	ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA1;
 	ConfigFileEntry.hide_opers_in_whois = 0;
 
 	if (!alias_dict)
-		alias_dict = rb_dictionary_create("alias", strcasecmp);
+		alias_dict = rb_dictionary_create("alias", rb_strcasecmp);
 }
 
 /*
@@ -862,20 +857,29 @@ validate_conf(void)
 	if(ServerInfo.ssld_count < 1)
 		ServerInfo.ssld_count = 1;
 
+	/* XXX: configurable? */
+	ServerInfo.wsockd_count = 1;
+
 	if(!rb_setup_ssl_server(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list))
 	{
 		ilog(L_MAIN, "WARNING: Unable to setup SSL.");
 		ircd_ssl_ok = false;
 	} else {
 		ircd_ssl_ok = true;
-		send_new_ssl_certs(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+		ssld_update_config();
 	}
 
 	if(ServerInfo.ssld_count > get_ssld_count())
 	{
 		int start = ServerInfo.ssld_count - get_ssld_count();
 		/* start up additional ssld if needed */
-		start_ssldaemon(start, ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+		start_ssldaemon(start);
+	}
+
+	if(ServerInfo.wsockd_count > get_wsockd_count())
+	{
+		int start = ServerInfo.wsockd_count - get_wsockd_count();
+		start_wsockd(start);
 	}
 
 	/* General conf */
@@ -915,6 +919,12 @@ validate_conf(void)
 		splitmode = 0;
 		splitchecking = 0;
 	}
+
+	CharAttrs['&'] |= CHANPFX_C;
+	if (ConfigChannel.disable_local_channels)
+		CharAttrs['&'] &= ~CHANPFX_C;
+
+	chantypes_update();
 }
 
 /* add_temp_kline()
@@ -1526,7 +1536,7 @@ clear_out_old_conf(void)
 		alias_dict = NULL;
 	}
 
-	destroy_blacklists();
+	del_blacklist_all();
 
 	privilegeset_mark_all_illegal();
 
@@ -1605,15 +1615,15 @@ conf_add_d_conf(struct ConfItem *aconf)
 	}
 }
 
-static char *
-strip_tabs(char *dest, const char *src, size_t len)
+static void
+strip_tabs(char *dest, const char *src, size_t size)
 {
 	char *d = dest;
 
 	if(dest == NULL || src == NULL)
-		return NULL;
+		return;
 
-	rb_strlcpy(dest, src, len);
+	rb_strlcpy(dest, src, size);
 
 	while(*d)
 	{
@@ -1621,7 +1631,6 @@ strip_tabs(char *dest, const char *src, size_t len)
 			*d = ' ';
 		d++;
 	}
-	return dest;
 }
 
 /*
@@ -1636,7 +1645,7 @@ yyerror(const char *msg)
 {
 	char newlinebuf[BUFSIZE];
 
-	strip_tabs(newlinebuf, linebuf, strlen(linebuf));
+	strip_tabs(newlinebuf, yy_linebuf, sizeof(newlinebuf));
 
 	ierror("\"%s\", line %d: %s at '%s'", conffilebuf, lineno + 1, msg, newlinebuf);
 	sendto_realops_snomask(SNO_GENERAL, L_ALL, "\"%s\", line %d: %s at '%s'",

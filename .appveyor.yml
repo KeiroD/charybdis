@@ -1,4 +1,4 @@
-version: 3.6-dev_{build}
+version: 4_{build}
 clone_depth: 10
 install:
   - c:\msys64\usr\bin\sh.exe -lc "pacman -Sy --noconfirm git"
@@ -13,3 +13,6 @@ build_script:
 on_failure:
   - ps: Push-AppveyorArtifact config.log
   - ps: Push-AppveyorArtifact librb\include\librb-config.h
+branches:
+  except:
+    - release/3.5

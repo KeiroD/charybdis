@@ -58,7 +58,7 @@ char *current_file = conffilebuf;
 
 FILE *inc_fbfile_in[MAX_INCLUDE_DEPTH];
 
-char linebuf[512];
+char yy_linebuf[16384];
 
 #undef YY_INPUT
 
@@ -66,7 +66,7 @@ char linebuf[512];
 
 #define YY_INPUT(buf,result,max_size) \
   if (!(result = conf_fgets(buf, max_size, conf_fbfile_in))) \
-    YY_FATAL_ERROR("input in flex scanner failed"); 
+    YY_FATAL_ERROR("input in flex scanner failed");
 %}
 
 ws        [ \t]*
@@ -79,7 +79,7 @@ include   \.include{ws}(\<.*\>|\".*\")
 %%
 {include}       { cinclude(); }
 "/*"            { ccomment(); }
-\n.*            { strcpy(linebuf, yytext+1); lineno++; yyless(1); }
+\n.*            { rb_strlcpy(yy_linebuf, yytext+1, sizeof(yy_linebuf)); lineno++; yyless(1); }
 
 {ws}            ;
 {comment}       { hashcomment(); }
@@ -94,16 +94,16 @@ include   \.include{ws}(\<.*\>|\".*\")
                     }
                   else
                     {
-                      strcpy(yylval.string, yytext + 1);
+                      rb_strlcpy(yylval.string, yytext + 1, 1024);
                       if(yylval.string[yyleng-2] != '"')
                         ilog(L_MAIN, "Unterminated character string");
                       else
                         {
                           int i,j;
                           yylval.string[yyleng-2] = '\0'; /* remove close
-                                                           *  quote 
+                                                           *  quote
                                                            */
-                          
+
                           for (j=i=0 ;yylval.string[i] != '\0'; i++,j++)
                             {
                               if (yylval.string[i] != '\\')
@@ -113,7 +113,7 @@ include   \.include{ws}(\<.*\>|\".*\")
                               else
                                 {
                                   i++;
-                                  if (yylval.string[i] == '\0') /* XXX 
+                                  if (yylval.string[i] == '\0') /* XXX
                                                                  * should not
                                                                  * happen
                                                                  */
@@ -133,8 +133,8 @@ include   \.include{ws}(\<.*\>|\".*\")
 
 
 loadmodule	{ return LOADMODULE; }
-{string}        { 
-		  strcpy(yylval.string, yytext);
+{string}        {
+		  rb_strlcpy(yylval.string, yytext, 1024);
                   yylval.string[yyleng] = '\0';
                   return STRING;
                 }
@@ -148,7 +148,7 @@ loadmodule	{ return LOADMODULE; }
 void ccomment()
 {
   int c;
-  
+
   /* log(L_NOTICE, "got comment"); */
   while (1)
     {
@@ -157,7 +157,7 @@ void ccomment()
       if (c == '*')
         {
           while ((c = input()) == '*');
-          if (c == '/') 
+          if (c == '/')
             break;
           if (c == '\n') ++lineno;
         }
@@ -182,21 +182,21 @@ void cinclude(void)
   else
     *strchr(++c, '>') = 0;
 
-  /* do stacking and co. */ 
+  /* do stacking and co. */
   if (include_stack_ptr >= MAX_INCLUDE_DEPTH)
     conf_report_error("Includes nested too deep (max is %d)", MAX_INCLUDE_DEPTH);
   else
   {
     FILE *tmp_fbfile_in;
-    
+
     tmp_fbfile_in = fopen(c, "r");
-    
+
     if (tmp_fbfile_in == NULL)
     {
       /* if its not found in PREFIX, look in IRCD_PATH_ETC */
       char fnamebuf[BUFSIZE];
 
-      snprintf(fnamebuf, sizeof(fnamebuf), "%s%c%s", IRCD_PATH_ETC, RB_PATH_SEPARATOR, c);
+      snprintf(fnamebuf, sizeof(fnamebuf), "%s%c%s", ircd_paths[IRCD_PATH_ETC], RB_PATH_SEPARATOR, c);
       tmp_fbfile_in = fopen(fnamebuf, "r");
 
       /* wasnt found there either.. error. */
@@ -251,6 +251,6 @@ void hashcomment(void)
   if (strlen(yytext) < sizeof(INCLUDE) - 1)
     return;
 
-  if (!strncasecmp(yytext, INCLUDE, sizeof(INCLUDE) - 1))
+  if (!rb_strncasecmp(yytext, INCLUDE, sizeof(INCLUDE) - 1))
       yyerror("You probably meant '.include', skipping");
 }

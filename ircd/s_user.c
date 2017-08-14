@@ -48,7 +48,6 @@
 #include "hook.h"
 #include "monitor.h"
 #include "snomask.h"
-#include "blacklist.h"
 #include "substitution.h"
 #include "chmode.h"
 #include "s_assert.h"
@@ -189,6 +188,139 @@ show_lusers(struct Client *source_p)
 			   Count.totalrestartcount);
 }
 
+/* check if we should exit a client due to authd decision
+ * inputs	- client server, client connecting
+ * outputs	- true if exited, false if not
+ * side effects	- messages/exits client if authd rejected and not exempt
+ */
+static bool
+authd_check(struct Client *client_p, struct Client *source_p)
+{
+	struct ConfItem *aconf = source_p->localClient->att_conf;
+	rb_dlink_list varlist = { NULL, NULL, 0 };
+	bool reject = false;
+	char *reason;
+
+	if(source_p->preClient->auth.accepted == true)
+		return reject;
+
+	substitution_append_var(&varlist, "nick", source_p->name);
+	substitution_append_var(&varlist, "ip", source_p->sockhost);
+	substitution_append_var(&varlist, "host", source_p->host);
+	substitution_append_var(&varlist, "dnsbl-host", source_p->preClient->auth.data);
+	substitution_append_var(&varlist, "network-name", ServerInfo.network_name);
+	reason = substitution_parse(source_p->preClient->auth.reason, &varlist);
+
+	switch(source_p->preClient->auth.cause)
+	{
+	case 'B':	/* Blacklists */
+		{
+			struct BlacklistStats *stats;
+			char *blacklist = source_p->preClient->auth.data;
+
+			if(bl_stats != NULL)
+				if((stats = rb_dictionary_retrieve(bl_stats, blacklist)) != NULL)
+					stats->hits++;
+
+			if(IsExemptKline(source_p) || IsConfExemptDNSBL(aconf))
+			{
+				sendto_one_notice(source_p, ":*** Your IP address %s is listed in %s, but you are exempt",
+						source_p->sockhost, blacklist);
+				break;
+			}
+
+			sendto_realops_snomask(SNO_REJ, L_NETWIDE,
+				"Listed on DNSBL %s: %s (%s@%s) [%s] [%s]",
+				blacklist, source_p->name, source_p->username, source_p->host,
+				IsIPSpoof(source_p) ? "255.255.255.255" : source_p->sockhost,
+				source_p->info);
+
+			sendto_one(source_p, form_str(ERR_YOUREBANNEDCREEP),
+				me.name, source_p->name, reason);
+
+			sendto_one_notice(source_p, ":*** Your IP address %s is listed in %s",
+				source_p->sockhost, blacklist);
+			add_reject(source_p, NULL, NULL);
+			exit_client(client_p, source_p, &me, "Banned (DNS blacklist)");
+			reject = true;
+		}
+		break;
+	case 'O':	/* OPM */
+		{
+			char *proxy = source_p->preClient->auth.data;
+			char *port = strrchr(proxy, ':');
+
+			if(port == NULL)
+			{
+				/* This shouldn't happen, better tell the ops... */
+				ierror("authd sent us a malformed OPM string %s", proxy);
+				sendto_realops_snomask(SNO_GENERAL, L_ALL,
+					"authd sent us a malformed OPM string %s", proxy);
+				break;
+			}
+
+			/* Terminate the proxy type */
+			*(port++) = '\0';
+
+			if(IsExemptKline(source_p) || IsConfExemptProxy(aconf))
+			{
+				sendto_one_notice(source_p,
+					":*** Your IP address %s has been detected as an open proxy (type %s, port %s), but you are exempt",
+					source_p->sockhost, proxy, port);
+				break;
+			}
+			sendto_realops_snomask(SNO_REJ, L_NETWIDE,
+				"Open proxy %s/%s: %s (%s@%s) [%s] [%s]",
+				proxy, port,
+				source_p->name,
+				source_p->username, source_p->host,
+				IsIPSpoof(source_p) ? "255.255.255.255" : source_p->sockhost,
+				source_p->info);
+
+			sendto_one(source_p, form_str(ERR_YOUREBANNEDCREEP),
+					me.name, source_p->name, reason);
+
+			sendto_one_notice(source_p,
+				":*** Your IP address %s has been detected as an open proxy (type %s, port %s)",
+				source_p->sockhost, proxy, port);
+			add_reject(source_p, NULL, NULL);
+			exit_client(client_p, source_p, &me, "Banned (Open proxy)");
+			reject = true;
+		}
+		break;
+	default:	/* Unknown, but handle the case properly */
+		if(IsExemptKline(source_p))
+		{
+			sendto_one_notice(source_p,
+				":*** You were rejected, but you are exempt (reason: %s)",
+				reason);
+			break;
+		}
+		sendto_realops_snomask(SNO_REJ, L_NETWIDE,
+			"Rejected by authentication system (reason %s): %s (%s@%s) [%s] [%s]",
+			reason, source_p->name, source_p->username, source_p->host,
+			IsIPSpoof(source_p) ? "255.255.255.255" : source_p->sockhost,
+			source_p->info);
+
+		sendto_one(source_p, form_str(ERR_YOUREBANNEDCREEP),
+			me.name, source_p->name, reason);
+
+		sendto_one_notice(source_p, ":*** Rejected by authentication system: %s",
+			reason);
+		add_reject(source_p, NULL, NULL);
+		exit_client(client_p, source_p, &me, "Banned (authentication system)");
+		reject = true;
+		break;
+	}
+
+	if(reject)
+		ServerStats.is_ref++;
+
+	substitution_free(&varlist);
+
+	return reject;
+}
+
 /*
 ** register_local_user
 **      This function is called when both NICK and USER messages
@@ -212,12 +344,10 @@ show_lusers(struct Client *source_p)
 **         this is not fair. It should actually request another
 **         nick from local user or kill him/her...
  */
-
 int
 register_local_user(struct Client *client_p, struct Client *source_p)
 {
 	struct ConfItem *aconf, *xconf;
-	struct User *user = source_p->user;
 	char tmpstr2[BUFSIZE];
 	char ipaddr[HOSTIPLEN];
 	char myusername[USERLEN+1];
@@ -236,9 +366,9 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 	{
 		if(!(source_p->flags & FLAGS_PINGSENT) && source_p->localClient->random_ping == 0)
 		{
-			source_p->localClient->random_ping = (unsigned long) (rand() * rand()) << 1;
-			sendto_one(source_p, "PING :%08lX",
-				   (unsigned long) source_p->localClient->random_ping);
+			source_p->localClient->random_ping = (uint32_t)(((rand() * rand()) << 1) | 1);
+			sendto_one(source_p, "PING :%08X",
+				   (unsigned int) source_p->localClient->random_ping);
 			source_p->flags |= FLAGS_PINGSENT;
 			return -1;
 		}
@@ -252,8 +382,8 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 	if(source_p->flags & FLAGS_CLICAP)
 		return -1;
 
-	/* still has DNSbls to validate against */
-	if(rb_dlink_list_length(&source_p->preClient->dnsbl_queries) > 0)
+	/* Waiting on authd */
+	if(source_p->preClient->auth.cid)
 		return -1;
 
 	client_p->localClient->last = rb_current_time();
@@ -300,7 +430,6 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 
 		rb_strlcpy(source_p->host, source_p->sockhost, sizeof(source_p->host));
  	}
-
 
 	aconf = source_p->localClient->att_conf;
 
@@ -350,7 +479,7 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 		}
 	}
 
-	if(IsNeedSasl(aconf) && !*user->suser)
+	if(IsNeedSasl(aconf) && !*source_p->user->suser)
 	{
 		ServerStats.is_ref++;
 		sendto_one_notice(source_p, ":*** Notice -- You need to identify via SASL to use this server");
@@ -388,7 +517,7 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 		}
 	}
 
-	/* report if user has &^>= etc. and set flags as needed in source_p */
+	/* report and set flags (kline exempt etc.) as needed in source_p */
 	report_and_set_user_flags(source_p, aconf);
 
 	/* Limit clients */
@@ -421,46 +550,9 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 		return CLIENT_EXITED;
 	}
 
-	/* dnsbl check */
-	if (source_p->preClient->dnsbl_listed != NULL)
-	{
-		if (IsExemptKline(source_p) || IsConfExemptDNSBL(aconf))
-			sendto_one_notice(source_p, ":*** Your IP address %s is listed in %s, but you are exempt",
-					source_p->sockhost, source_p->preClient->dnsbl_listed->host);
-		else
-		{
-			sendto_realops_snomask(SNO_REJ, L_NETWIDE,
-				"Listed on DNSBL %s: %s (%s@%s) [%s] [%s]",
-				source_p->preClient->dnsbl_listed->host,
-				source_p->name,
-				source_p->username, source_p->host,
-				IsIPSpoof(source_p) ? "255.255.255.255" : source_p->sockhost,
-				source_p->info);
-
-			rb_dlink_list varlist = { NULL, NULL, 0 };
-
-			substitution_append_var(&varlist, "nick", source_p->name);
-			substitution_append_var(&varlist, "ip", source_p->sockhost);
-			substitution_append_var(&varlist, "host", source_p->host);
-			substitution_append_var(&varlist, "dnsbl-host", source_p->preClient->dnsbl_listed->host);
-			substitution_append_var(&varlist, "network-name", ServerInfo.network_name);
-
-			ServerStats.is_ref++;
-
-			sendto_one(source_p, form_str(ERR_YOUREBANNEDCREEP),
-					me.name, source_p->name,
-					substitution_parse(source_p->preClient->dnsbl_listed->reject_reason, &varlist));
-
-			substitution_free(&varlist);
-
-			sendto_one_notice(source_p, ":*** Your IP address %s is listed in %s",
-					source_p->sockhost, source_p->preClient->dnsbl_listed->host);
-			source_p->preClient->dnsbl_listed->hits++;
-			add_reject(source_p, NULL, NULL);
-			exit_client(client_p, source_p, &me, "*** Banned (DNS blacklist)");
-			return CLIENT_EXITED;
-		}
-	}
+	/* authd rejection check */
+	if(authd_check(client_p, source_p))
+		return CLIENT_EXITED;
 
 	/* valid user name check */
 
@@ -528,7 +620,7 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 	 */
 	if(!*source_p->id)
 	{
-		strcpy(source_p->id, generate_uid());
+		rb_strlcpy(source_p->id, generate_uid(), sizeof(source_p->id));
 		add_to_id_hash(source_p->id, source_p);
 	}
 
@@ -572,7 +664,7 @@ register_local_user(struct Client *client_p, struct Client *source_p)
 
 	free_pre_client(source_p);
 
-	introduce_client(client_p, source_p, user, source_p->name, 1);
+	introduce_client(client_p, source_p, source_p->user, source_p->name, 1);
 	return 0;
 }
 
@@ -1019,7 +1111,7 @@ user_mode(struct Client *client_p, struct Client *source_p, int parc, const char
 						source_p->snomask = 0;
 						showsnomask = true;
 					}
-					source_p->flags2 &= ~OPER_FLAGS;
+					source_p->flags &= ~OPER_FLAGS;
 
 					rb_free(source_p->localClient->opername);
 					source_p->localClient->opername = NULL;
@@ -1312,7 +1404,7 @@ oper_up(struct Client *source_p, struct oper_conf *oper_p)
 	SetExtendChans(source_p);
 	SetExemptKline(source_p);
 
-	source_p->flags2 |= oper_p->flags;
+	source_p->flags |= oper_p->flags;
 	source_p->localClient->opername = rb_strdup(oper_p->name);
 	source_p->localClient->privset = privilegeset_ref(oper_p->privset);
 
@@ -1384,17 +1476,14 @@ construct_umodebuf(void)
 			if (user_modes[i] == 0)
 			{
 				orphaned_umodes |= prev_user_modes[i];
-				sendto_realops_snomask(SNO_DEBUG, L_ALL, "Umode +%c is now orphaned", i);
+				user_modes[i] = prev_user_modes[i];
 			}
 			else
-			{
 				orphaned_umodes &= ~prev_user_modes[i];
-				sendto_realops_snomask(SNO_DEBUG, L_ALL, "Orphaned umode +%c is picked up by module", i);
-			}
-			user_modes[i] = prev_user_modes[i];
 		}
 		else
 			prev_user_modes[i] = user_modes[i];
+
 		if (user_modes[i])
 			*ptr++ = (char) i;
 	}

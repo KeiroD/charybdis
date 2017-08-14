@@ -38,7 +38,6 @@
 #include "s_conf.h"		/* ConfigFileEntry, ConfigChannel */
 #include "s_newconf.h"
 #include "logger.h"
-#include "ipv4_from_ipv6.h"
 #include "s_assert.h"
 
 struct config_channel_entry ConfigChannel;
@@ -127,10 +126,10 @@ send_channel_join(struct Channel *chptr, struct Client *client_p)
 	if (!IsClient(client_p))
 		return;
 
-	sendto_channel_local_with_capability(ALL_MEMBERS, NOCAPS, CLICAP_EXTENDED_JOIN, chptr, ":%s!%s@%s JOIN %s",
+	sendto_channel_local_with_capability(client_p, ALL_MEMBERS, NOCAPS, CLICAP_EXTENDED_JOIN, chptr, ":%s!%s@%s JOIN %s",
 					     client_p->name, client_p->username, client_p->host, chptr->chname);
 
-	sendto_channel_local_with_capability(ALL_MEMBERS, CLICAP_EXTENDED_JOIN, NOCAPS, chptr, ":%s!%s@%s JOIN %s %s :%s",
+	sendto_channel_local_with_capability(client_p, ALL_MEMBERS, CLICAP_EXTENDED_JOIN, NOCAPS, chptr, ":%s!%s@%s JOIN %s %s :%s",
 					     client_p->name, client_p->username, client_p->host, chptr->chname,
 					     EmptyString(client_p->user->suser) ? "*" : client_p->user->suser,
 					     client_p->info);
@@ -581,7 +580,7 @@ is_banned_list(struct Channel *chptr, rb_dlink_list *list,
 	}
 #ifdef RB_IPV6
 	if(GET_SS_FAMILY(&who->localClient->ip) == AF_INET6 &&
-			ipv4_from_ipv6((const struct sockaddr_in6 *)&who->localClient->ip, &ip4))
+			rb_ipv4_from_ipv6((const struct sockaddr_in6 *)&who->localClient->ip, &ip4))
 	{
 		sprintf(src_ip4host, "%s!%s@", who->name, who->username);
 		s4 = src_ip4host + strlen(src_ip4host);
@@ -668,6 +667,7 @@ int
 is_banned(struct Channel *chptr, struct Client *who, struct membership *msptr,
 	  const char *s, const char *s2, const char **forward)
 {
+#if 0
 	if (chptr->last_checked_client != NULL &&
 		who == chptr->last_checked_client &&
 		chptr->last_checked_type == CHFL_BAN &&
@@ -680,6 +680,9 @@ is_banned(struct Channel *chptr, struct Client *who, struct membership *msptr,
 	chptr->last_checked_ts = rb_current_time();
 
 	return chptr->last_checked_result;
+#else
+	return is_banned_list(chptr, &chptr->banlist, who, msptr, s, s2, forward);
+#endif
 }
 
 /* is_quieted()
@@ -693,6 +696,7 @@ int
 is_quieted(struct Channel *chptr, struct Client *who, struct membership *msptr,
 	   const char *s, const char *s2)
 {
+#if 0
 	if (chptr->last_checked_client != NULL &&
 		who == chptr->last_checked_client &&
 		chptr->last_checked_type == CHFL_QUIET &&
@@ -705,6 +709,9 @@ is_quieted(struct Channel *chptr, struct Client *who, struct membership *msptr,
 	chptr->last_checked_ts = rb_current_time();
 
 	return chptr->last_checked_result;
+#else
+	return is_banned_list(chptr, &chptr->quietlist, who, msptr, s, s2, NULL);
+#endif
 }
 
 /* can_join()
@@ -1260,7 +1267,7 @@ send_cap_mode_changes(struct Client *client_p, struct Client *source_p,
 	char *pbuf;
 	const char *arg;
 	int dir;
-	int arglen;
+	int arglen = 0;
 
 	/* Now send to servers... */
 	mc = 0;
@@ -1376,7 +1383,7 @@ resv_chan_forcepart(const char *name, const char *reason, int temp_time)
 			sendto_server(target_p, chptr, CAP_TS6, NOCAPS,
 			              ":%s PART %s", target_p->id, chptr->chname);
 
-			sendto_channel_local(ALL_MEMBERS, chptr, ":%s!%s@%s PART %s :%s",
+			sendto_channel_local(target_p, ALL_MEMBERS, chptr, ":%s!%s@%s PART %s :%s",
 			                     target_p->name, target_p->username,
 			                     target_p->host, chptr->chname, target_p->name);
 

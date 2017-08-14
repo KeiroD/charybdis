@@ -65,9 +65,9 @@ extern const unsigned long int datecode;
 extern const char *ircd_version;
 extern const char *logFileName;
 extern const char *pidFileName;
-extern bool dorehash;
-extern bool dorehashbans;
-extern bool doremotd;
+extern volatile sig_atomic_t dorehash;
+extern volatile sig_atomic_t dorehashbans;
+extern volatile sig_atomic_t doremotd;
 extern bool kline_queued;
 extern bool server_state_foreground;
 extern bool opers_see_all_users; /* sno_farconnect.so loaded, operspy without
@@ -103,6 +103,6 @@ extern bool ircd_ssl_ok;
 extern bool ircd_zlib_ok;
 extern int maxconnections;
 
-void ircd_shutdown(const char *reason);
+void ircd_shutdown(const char *reason) __attribute__((noreturn));
 
 #endif

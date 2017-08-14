@@ -39,7 +39,6 @@
 #include "numeric.h"
 #include "parse.h"
 #include "restart.h"
-#include "s_auth.h"
 #include "s_conf.h"
 #include "logger.h"
 #include "s_serv.h"		/* try_connections */
@@ -54,18 +53,21 @@
 #include "ircd_getopt.h"
 #include "newconf.h"
 #include "reject.h"
-#include "s_conf.h"
 #include "s_newconf.h"
 #include "cache.h"
 #include "monitor.h"
 #include "patchlevel.h"
 #include "serno.h"
 #include "sslproc.h"
+#include "wsproc.h"
 #include "chmode.h"
 #include "privilege.h"
 #include "bandbi.h"
-#include "authd.h"
+#include "authproc.h"
 #include "operhash.h"
+
+static void
+ircd_die_cb(const char *str) __attribute__((noreturn));
 
 /* /quote set variables */
 struct SetOptions GlobalSetOptions;
@@ -94,10 +96,10 @@ rb_dlink_list global_serv_list;    /* global servers on the network */
 rb_dlink_list local_oper_list;     /* our opers, duplicated in lclient_list */
 rb_dlink_list oper_list;           /* network opers */
 
-char **myargv;
-bool dorehash = false;
-bool dorehashbans = false;
-bool doremotd = false;
+char * const *myargv;
+volatile sig_atomic_t dorehash = false;
+volatile sig_atomic_t dorehashbans = false;
+volatile sig_atomic_t doremotd = false;
 bool kline_queued = false;
 bool server_state_foreground = false;
 bool opers_see_all_users = false;
@@ -134,6 +136,25 @@ const char *ircd_paths[IRCD_PATH_COUNT] = {
 	[IRCD_PATH_LIBEXEC] = PKGLIBEXECDIR,
 };
 
+const char *ircd_pathnames[IRCD_PATH_COUNT] = {
+	[IRCD_PATH_PREFIX] = "prefix",
+	[IRCD_PATH_MODULES] = "modules",
+	[IRCD_PATH_AUTOLOAD_MODULES] = "autoload modules",
+	[IRCD_PATH_ETC] = "config",
+	[IRCD_PATH_LOG] = "log",
+	[IRCD_PATH_USERHELP] = "user help",
+	[IRCD_PATH_OPERHELP] = "oper help",
+	[IRCD_PATH_IRCD_EXEC] = "ircd binary",
+	[IRCD_PATH_IRCD_CONF] = "ircd.conf",
+	[IRCD_PATH_IRCD_MOTD] = "ircd.motd",
+	[IRCD_PATH_IRCD_LOG] = "ircd.log",
+	[IRCD_PATH_IRCD_PID] = "ircd.pid",
+	[IRCD_PATH_IRCD_OMOTD] = "oper motd",
+	[IRCD_PATH_BANDB] = "bandb",
+	[IRCD_PATH_BIN] = "binary dir",
+	[IRCD_PATH_LIBEXEC] = "libexec dir",
+};
+
 const char *logFileName = NULL;
 const char *pidFileName = NULL;
 
@@ -167,51 +188,6 @@ ircd_shutdown(const char *reason)
 }
 
 /*
- * print_startup - print startup information
- */
-static void
-print_startup(int pid)
-{
-	int fd;
-
-#ifndef _WIN32
-	close(1);
-	fd = open("/dev/null", O_RDWR);
-	if (fd == -1) {
-		perror("open /dev/null");
-		exit(EXIT_FAILURE);
-	}
-	if (fd == 0)
-		fd = dup(fd);
-	if (fd != 1)
-		abort();
-#endif
-	inotice("runtime path: %s", rb_path_to_self());
-	inotice("now running in %s mode from %s as pid %d ...",
-	       !server_state_foreground ? "background" : "foreground",
-        	ConfigFileEntry.dpath, pid);
-
-#ifndef _WIN32
-	/* let the parent process know the initialization was successful
-	 * -- jilles */
-	if (!server_state_foreground)
-	{
-		/* GCC complains on Linux if we don't check the value of write pedantically.
-		 * Technically you're supposed to check the value, yes, but it probably can't fail.
-		 * No, casting to void is of no use to shut the warning up. You HAVE to use the value.
-		 * --Elizfaox
-		 */
-		if(write(0, ".", 1) < 1)
-			abort();
-	}
-	if (dup2(1, 0) == -1)
-		abort();
-	if (dup2(1, 2) == -1)
-		abort();
-#endif
-}
-
-/*
  * init_sys
  *
  * inputs	- boot_daemon flag
@@ -239,21 +215,22 @@ init_sys(void)
 	maxconnections = MAXCONNECTIONS;
 }
 
+#ifndef _WIN32
 static int
 make_daemon(void)
 {
-#ifndef _WIN32
-	int pid;
-	int pip[2];
-	char c;
+	int pid, nullfd, fdx;
 
-	if (pipe(pip) < 0)
+	/* The below is approximately what daemon(1, 0) does, but
+	   we need control over the parent after forking to print
+	   the startup message -- Aaron */
+
+	if((nullfd = open("/dev/null", O_RDWR)) < 0)
 	{
-		perror("pipe");
+		perror("open /dev/null");
 		exit(EXIT_FAILURE);
 	}
-	dup2(pip[1], 0);
-	close(pip[1]);
+
 	if((pid = fork()) < 0)
 	{
 		perror("fork");
@@ -261,25 +238,24 @@ make_daemon(void)
 	}
 	else if(pid > 0)
 	{
-		close(0);
-		/* Wait for initialization to finish, successfully or
-		 * unsuccessfully. Until this point the child may still
-		 * write to stdout/stderr.
-		 * -- jilles */
-		if (read(pip[0], &c, 1) > 0)
-			exit(EXIT_SUCCESS);
-		else
-			exit(EXIT_FAILURE);
+		inotice("now running in background mode from %s as pid %d ...",
+		        ConfigFileEntry.dpath, pid);
+
+		exit(EXIT_SUCCESS);
 	}
 
-	close(pip[0]);
-	setsid();
-/*	fclose(stdin);
-	fclose(stdout);
-	fclose(stderr); */
-#endif
+	for(fdx = 0; fdx <= 2; fdx++)
+		if (fdx != nullfd)
+			(void) dup2(nullfd, fdx);
+
+	if(nullfd > 2)
+		(void) close(nullfd);
+
+	(void) setsid();
+
 	return 0;
 }
+#endif
 
 static int printVersion = 0;
 
@@ -389,6 +365,7 @@ initialize_server_capabs(void)
 	default_server_capabs &= ~CAP_ZIP;
 }
 
+#ifdef _WIN32
 /*
  * relocate_paths
  *
@@ -465,7 +442,14 @@ relocate_paths(void)
 	snprintf(workbuf, sizeof workbuf, "%s%cbin", prefix, RB_PATH_SEPARATOR);
 	ircd_paths[IRCD_PATH_BIN] = rb_strdup(workbuf);
 	ircd_paths[IRCD_PATH_LIBEXEC] = rb_strdup(workbuf);
+
+	inotice("runtime paths:");
+	for (int i = 0; i < IRCD_PATH_COUNT; i++)
+	{
+		inotice("  %s: %s", ircd_pathnames[i], ircd_paths[i]);
+	}
 }
+#endif
 
 /*
  * write_pidfile
@@ -643,7 +627,7 @@ seed_random(void *unused)
  * Side Effects - this is where the ircd gets going right now
  */
 int
-charybdis_main(int argc, char *argv[])
+charybdis_main(int argc, char * const argv[])
 {
 	int fd;
 
@@ -656,7 +640,7 @@ charybdis_main(int argc, char *argv[])
 	}
 #endif
 
-#ifndef ENABLE_FHS_PATHS
+#ifdef _WIN32
 	relocate_paths();
 #endif
 
@@ -741,10 +725,13 @@ charybdis_main(int argc, char *argv[])
 	{
 		check_pidfile(pidFileName);
 
-		if(!server_state_foreground)
-			make_daemon();
 		inotice("starting %s ...", ircd_version);
 		inotice("%s", rb_lib_version());
+
+#ifndef _WIN32
+		if(!server_state_foreground)
+			make_daemon();
+#endif
 	}
 
 	/* Init the event subsystem */
@@ -777,12 +764,9 @@ charybdis_main(int argc, char *argv[])
 
         construct_cflags_strings();
 
-	load_all_modules(1);
-	load_core_modules(1);
-
-	init_auth();		/* Initialise the auth code */
 	init_authd();		/* Start up authd. */
 	init_dns();		/* Start up DNS query system */
+	init_modules();		/* Start up modules system */
 
 	privilegeset_set_new("default", "", 0);
 
@@ -790,13 +774,14 @@ charybdis_main(int argc, char *argv[])
 		fprintf(stderr, "\nBeginning config test\n");
 	read_conf_files(true);	/* cold start init conf files */
 
-	mod_add_path(MODULE_DIR);
-	mod_add_path(MODULE_DIR "/autoload");
+	load_all_modules(1);
+	load_core_modules(1);
 
 	init_isupport();
 
 	init_bandb();
 	init_ssld();
+	init_wsockd();
 
 	rehash_bans();
 
@@ -815,7 +800,7 @@ charybdis_main(int argc, char *argv[])
 		ierror("no server sid specified in serverinfo block.");
 		return -2;
 	}
-	strcpy(me.id, ServerInfo.sid);
+	rb_strlcpy(me.id, ServerInfo.sid, sizeof(me.id));
 	init_uid();
 
 	/* serverinfo{} description must exist.  If not, error out. */
@@ -826,7 +811,7 @@ charybdis_main(int argc, char *argv[])
 	}
 	rb_strlcpy(me.info, ServerInfo.description, sizeof(me.info));
 
-	if(ServerInfo.ssl_cert != NULL && ServerInfo.ssl_private_key != NULL)
+	if(ServerInfo.ssl_cert != NULL)
 	{
 		/* just do the rb_setup_ssl_server to validate the config */
 		if(!rb_setup_ssl_server(ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list))
@@ -836,13 +821,6 @@ charybdis_main(int argc, char *argv[])
 		}
 		else
 			ircd_ssl_ok = true;
-	}
-
-	if (testing_conf)
-	{
-		fprintf(stderr, "\nConfig testing complete.\n");
-		fflush(stderr);
-		return 0;	/* Why? We want the launcher to exit out. */
 	}
 
 	me.from = &me;
@@ -858,10 +836,19 @@ charybdis_main(int argc, char *argv[])
 
 	construct_umodebuf();
 
+	if (testing_conf)
+	{
+		fprintf(stderr, "\nConfig testing complete.\n");
+		fflush(stderr);
+		return 0;	/* Why? We want the launcher to exit out. */
+	}
+
 	check_class();
 	write_pidfile(pidFileName);
 	load_help();
 	open_logfiles();
+
+	configure_authd();
 
 	ilog(L_MAIN, "Server Ready");
 
@@ -878,7 +865,9 @@ charybdis_main(int argc, char *argv[])
 	if(splitmode)
 		check_splitmode_ev = rb_event_add("check_splitmode", check_splitmode, NULL, 5);
 
-	print_startup(getpid());
+	if(server_state_foreground)
+		inotice("now running in foreground mode from %s as pid %d ...",
+		        ConfigFileEntry.dpath, getpid());
 
 	rb_lib_loop(0);
 

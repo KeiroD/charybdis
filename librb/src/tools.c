@@ -83,7 +83,7 @@ rb_free_rb_dlink_node(rb_dlink_node *ptr)
  *   Changes a given buffer into an array of parameters.
  *   Taken from ircd-ratbox.
  *
- * inputs	- string to parse, array to put in
+ * inputs	- string to parse, array to put in (size >= maxpara)
  * outputs	- number of parameters
  */
 int
@@ -91,8 +91,6 @@ rb_string_to_array(char *string, char **parv, int maxpara)
 {
 	char *p, *xbuf = string;
 	int x = 0;
-
-	parv[x] = NULL;
 
 	if(string == NULL || string[0] == '\0')
 		return x;
@@ -108,13 +106,11 @@ rb_string_to_array(char *string, char **parv, int maxpara)
 		{
 			xbuf++;
 			parv[x++] = xbuf;
-			parv[x] = NULL;
 			return x;
 		}
 		else
 		{
 			parv[x++] = xbuf;
-			parv[x] = NULL;
 			if((p = strchr(xbuf, ' ')) != NULL)
 			{
 				*p++ = '\0';
@@ -134,9 +130,105 @@ rb_string_to_array(char *string, char **parv, int maxpara)
 		p++;
 
 	parv[x++] = p;
-	parv[x] = NULL;
 	return x;
 }
+
+#ifndef HAVE_STRCASECMP
+#ifndef _WIN32
+/* Fallback taken from FreeBSD. --Elizafox */
+int
+rb_strcasecmp(const char *s1, const char *s2)
+{
+	const unsigned char *us1 = (const unsigned char *)s1;
+	const unsigned char *us2 = (const unsigned char *)s2;
+
+	while (tolower(*us1) == tolower(*us2++))
+	{
+		if (*us1++ == '\0')
+			return 0;
+	}
+
+	return (tolower(*us1) - tolower(*--us2));
+}
+#else /* _WIN32 */
+int
+rb_strcasecmp(const char *s1, const char *s2)
+{
+	return stricmp(s1, s2);
+}
+#endif /* _WIN32 */
+#else /* HAVE_STRCASECMP */
+int
+rb_strcasecmp(const char *s1, const char *s2)
+{
+	return strcasecmp(s1, s2);
+}
+#endif
+
+#ifndef HAVE_STRNCASECMP
+#ifndef _WIN32
+/* Fallback taken from FreeBSD. --Elizafox */
+int
+rb_strncasecmp(const char *s1, const char *s2, size_t n)
+{
+	if (n != 0)
+	{
+		const unsigned char *us1 = (const unsigned char *)s1;
+		const unsigned char *us2 = (const unsigned char *)s2;
+
+		do
+		{
+			if (tolower(*us1) != tolower(*us2++))
+				return (tolower(*us1) - tolower(*--us2));
+			if (*us1++ == '\0')
+				break;
+		} while (--n != 0);
+	}
+	return 0;
+}
+#else /* _WIN32 */
+int
+rb_strncasecmp(const char *s1, const char *s2, size_t n)
+{
+	return strnicmp(s1, s2, n);
+}
+#endif /* _WIN32 */
+#else /* HAVE_STRNCASECMP */
+int
+rb_strncasecmp(const char *s1, const char *s2, size_t n)
+{
+	return strncasecmp(s1, s2, n);
+}
+#endif
+
+#ifndef HAVE_STRCASESTR
+/* Fallback taken from FreeBSD. --Elizafox */
+char *
+rb_strcasestr(const char *s, const char *find)
+{
+	char c, sc;
+	size_t len;
+
+	if ((c = *find++) != 0) {
+		c = tolower((unsigned char)c);
+		len = strlen(find);
+		do {
+			do {
+				if ((sc = *s++) == 0)
+					return (NULL);
+			} while ((char)tolower((unsigned char)sc) != c);
+		} while (rb_strncasecmp(s, find, len) != 0);
+		s--;
+	}
+	return ((char *)s);
+}
+#else
+char *
+rb_strcasestr(const char *s, const char *find)
+{
+	return strcasestr(s, find);
+}
+#endif
 
 #ifndef HAVE_STRLCAT
 size_t
@@ -211,22 +303,60 @@ int
 rb_snprintf_append(char *str, size_t len, const char *format, ...)
 {
 	if(len == 0)
-		return 0;
+		return -1;
 
-	size_t x = strlen(str);
+	int orig_len = strlen(str);
 
-	if(len < x)
+	if((int)len < orig_len)
 	{
 		str[len - 1] = '\0';
-		return (int)len - 1;
+		return len - 1;
 	}
 
 	va_list ap;
 	va_start(ap, format);
-	int y = (vsnprintf(str + x, len - x, format, ap) + (int)x);
+	int append_len = vsnprintf(str + orig_len, len - orig_len, format, ap);
 	va_end(ap);
 
-	return (y);
+	if (append_len < 0)
+		return append_len;
+
+	return (orig_len + append_len);
+}
+
+/*
+ * rb_snprintf_try_append()
+ * appends snprintf formatted string to the end of the buffer but not
+ * exceeding len
+ * returns -1 if there isn't enough space for the whole string to fit
+ */
+int
+rb_snprintf_try_append(char *str, size_t len, const char *format, ...)
+{
+	if(len == 0)
+		return -1;
+
+	int orig_len = strlen(str);
+
+	if((int)len < orig_len) {
+		str[len - 1] = '\0';
+		return -1;
+	}
+
+	va_list ap;
+	va_start(ap, format);
+	int append_len = vsnprintf(str + orig_len, len - orig_len, format, ap);
+	va_end(ap);
+
+	if (append_len < 0)
+		return append_len;
+
+	if (orig_len + append_len > (int)(len - 1)) {
+		str[orig_len] = '\0';
+		return -1;
+	}
+
+	return (orig_len + append_len);
 }
 
 /* rb_basename
@@ -269,127 +399,68 @@ rb_dirname (const char *path)
 	return rb_strndup(path, ((uintptr_t)s - (uintptr_t)path) + 2);
 }
 
-size_t rb_zstring_serialized(rb_zstring_t *zs, void **buf, size_t *buflen)
+
+
+int rb_fsnprint(char *buf, size_t len, const rb_strf_t *strings)
 {
-        uint8_t *p;
-        size_t alloclen = sizeof(uint16_t) + zs->len;
+	size_t used = 0;
+	size_t remaining = len;
 
-        p = rb_malloc(sizeof(alloclen));
-        memcpy(p, &zs->len, sizeof(uint16_t));
-        p += sizeof(uint16_t);
-        memcpy(p, zs->data, zs->len);
-        return alloclen;
-}
+	while (strings != NULL) {
+		int ret = 0;
 
-size_t rb_zstring_deserialize(rb_zstring_t *zs, void *buf)
-{
-	uint8_t *p = (uint8_t *)buf;
+		if (strings->length != 0) {
+			remaining = strings->length;
+			if (remaining > len - used)
+				remaining = len - used;
+		}
 
-	memcpy(&zs->len, p, sizeof(uint16_t));
-	p += sizeof(uint16_t);
-	if(zs->len == 0)
-	{
-		zs->data = NULL;
-		return sizeof(uint16_t);
-	}
-	zs->data = rb_malloc(zs->len);
-	memcpy(zs->data, p, zs->len);
-	return zs->len + sizeof(uint16_t);
-}
+		if (remaining == 0)
+			break;
 
-void rb_zstring_free(rb_zstring_t *zs)
-{
-	rb_free(zs->data);
-	rb_free(zs);
+		if (strings->format != NULL) {
+			if (strings->format_args != NULL) {
+				ret = vsnprintf(buf + used, remaining,
+					strings->format, *strings->format_args);
+			} else {
+				ret = rb_strlcpy(buf + used,
+					strings->format, remaining);
+			}
+		} else if (strings->func != NULL) {
+			ret = strings->func(buf + used, remaining,
+				strings->func_args);
+		}
 
-}
+		if (ret < 0) {
+			return ret;
+		} else if ((size_t)ret > remaining - 1) {
+			used += remaining - 1;
+		} else {
+			used += ret;
+		}
 
-rb_zstring_t *rb_zstring_alloc(void)
-{
-	rb_zstring_t *zs = rb_malloc(sizeof(rb_zstring_t));
-	return zs;
-}
+		if (used >= len - 1) {
+			used = len - 1;
+			break;
+		}
 
-rb_zstring_t *rb_zstring_from_c_len(const char *buf, size_t len)
-{
-	rb_zstring_t *zs;
-
-	if(len > UINT16_MAX-1)
-		return NULL;
-
-	zs = rb_zstring_alloc();
-	zs->alloclen = zs->len = (uint16_t)len;
-	zs->alloclen = (uint16_t)len;
-	if(zs->alloclen < 128)
-		zs->alloclen = 128;
-	zs->data = rb_malloc(zs->alloclen);
-	memcpy(zs->data, buf, zs->len);
-	return(zs);
-}
-
-rb_zstring_t *rb_zstring_from_c(const char *buf)
-{
-	return rb_zstring_from_c_len(buf, strlen(buf));
-}
-
-size_t rb_zstring_len(rb_zstring_t *zs)
-{
-	return zs->len;
-}
-
-void rb_zstring_append_from_zstring(rb_zstring_t *dst_zs, rb_zstring_t *src_zs)
-{
-	void *ep;
-	size_t nlen = dst_zs->len + src_zs->len;
-
-	if(nlen > dst_zs->alloclen)
-	{
-		dst_zs->alloclen += src_zs->len + 64;
-		dst_zs->data = rb_realloc(dst_zs->data, dst_zs->alloclen);
+		remaining -= ret;
+		strings = strings->next;
 	}
 
-	ep = dst_zs->data + dst_zs->len;
-	memcpy(ep, src_zs->data, src_zs->len);
+	return used;
 }
 
-void rb_zstring_append_from_c(rb_zstring_t *zs, const char *buf, size_t len)
+int rb_fsnprintf(char *buf, size_t len, const rb_strf_t *strings, const char *format, ...)
 {
-	void *ep;
-	size_t nlen = zs->len + len;
+	va_list args;
+	rb_strf_t prepend_string = { .format = format, .format_args = &args, .next = strings };
+	int ret;
 
-	if(nlen > zs->alloclen)
-	{
-		zs->alloclen += len + 64;
-		zs->data = rb_realloc(zs->data, zs->alloclen);
-	}
-	ep = zs->data + zs->len;
-	zs->len += len;
-	memcpy(ep, buf, len);
+	va_start(args, format);
+	ret = rb_fsnprint(buf, len, &prepend_string);
+	va_end(args);
+
+	return ret;
 }
 
-char *rb_zstring_to_c(rb_zstring_t *zs, char *buf, size_t len)
-{
-        size_t cpylen;
-        if(len < zs->len)
-                cpylen = len - 1;
-        else
-                cpylen = zs->len;
-        buf[cpylen] = '\0';
-        memcpy(buf, zs->data, cpylen);
-        return buf;
-}
-
-
-char *rb_zstring_to_c_alloc(rb_zstring_t *zs)
-{
-	char *p;
-	p = rb_malloc(zs->len+1);
-	memcpy(p, zs->data, zs->len);
-	return p;
-}
-
-size_t rb_zstring_to_ptr(rb_zstring_t *zs, void **ptr)
-{
-	*ptr = (void *)zs->data;
-	return zs->len;
-}

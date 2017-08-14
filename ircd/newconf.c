@@ -24,14 +24,16 @@
 #include "cache.h"
 #include "ircd.h"
 #include "snomask.h"
-#include "blacklist.h"
 #include "sslproc.h"
+#include "wsproc.h"
 #include "privilege.h"
 #include "chmode.h"
+#include "certfp.h"
 
 #define CF_TYPE(x) ((x) & CF_MTYPE)
 
 static int yy_defer_accept = 1;
+static int yy_wsock = 0;
 
 struct TopConf *conf_cur_block;
 static char *conf_cur_block_name = NULL;
@@ -55,9 +57,15 @@ static struct alias_entry *yy_alias = NULL;
 
 static char *yy_blacklist_host = NULL;
 static char *yy_blacklist_reason = NULL;
-static int yy_blacklist_ipv4 = 1;
-static int yy_blacklist_ipv6 = 0;
-static rb_dlink_list yy_blacklist_filters;
+static uint8_t yy_blacklist_iptype = 0;
+static rb_dlink_list yy_blacklist_filters = { NULL, NULL, 0 };
+
+static char *yy_opm_address_ipv4 = NULL;
+static char *yy_opm_address_ipv6 = NULL;
+static uint16_t yy_opm_port_ipv4 = 0;
+static uint16_t yy_opm_port_ipv6 = 0;
+static int yy_opm_timeout = 0;
+static rb_dlink_list yy_opm_scanner_list;
 
 static char *yy_privset_extends = NULL;
 
@@ -107,7 +115,7 @@ find_top_conf(const char *name)
 	RB_DLINK_FOREACH(d, conf_items.head)
 	{
 		tc = d->data;
-		if(strcasecmp(tc->tc_name, name) == 0)
+		if(rb_strcasecmp(tc->tc_name, name) == 0)
 			return tc;
 	}
 
@@ -129,7 +137,7 @@ find_conf_item(const struct TopConf *top, const char *name)
 		{
 			cf = &top->tc_entries[i];
 
-			if(!strcasecmp(cf->cf_name, name))
+			if(!rb_strcasecmp(cf->cf_name, name))
 				return cf;
 		}
 	}
@@ -137,7 +145,7 @@ find_conf_item(const struct TopConf *top, const char *name)
 	RB_DLINK_FOREACH(d, top->tc_items.head)
 	{
 		cf = d->data;
-		if(strcasecmp(cf->cf_name, name) == 0)
+		if(rb_strcasecmp(cf->cf_name, name) == 0)
 			return cf;
 	}
 
@@ -217,7 +225,7 @@ conf_set_serverinfo_sid(void *data)
 			return;
 		}
 
-		strcpy(ServerInfo.sid, sid);
+		rb_strlcpy(ServerInfo.sid, sid, sizeof(ServerInfo.sid));
 	}
 }
 
@@ -236,27 +244,31 @@ conf_set_serverinfo_network_name(void *data)
 static void
 conf_set_serverinfo_vhost(void *data)
 {
-	if(rb_inet_pton(AF_INET, (char *) data, &ServerInfo.ip.sin_addr) <= 0)
+	struct rb_sockaddr_storage addr;
+
+	if(rb_inet_pton_sock(data, (struct sockaddr *)&addr) <= 0 || GET_SS_FAMILY(&addr) != AF_INET)
 	{
 		conf_report_error("Invalid IPv4 address for server vhost (%s)", (char *) data);
 		return;
 	}
-	ServerInfo.ip.sin_family = AF_INET;
-	ServerInfo.specific_ipv4_vhost = 1;
+
+	ServerInfo.bind4 = addr;
 }
 
 static void
 conf_set_serverinfo_vhost6(void *data)
 {
+
 #ifdef RB_IPV6
-	if(rb_inet_pton(AF_INET6, (char *) data, &ServerInfo.ip6.sin6_addr) <= 0)
+	struct rb_sockaddr_storage addr;
+
+	if(rb_inet_pton_sock(data, (struct sockaddr *)&addr) <= 0 || GET_SS_FAMILY(&addr) != AF_INET6)
 	{
 		conf_report_error("Invalid IPv6 address for server vhost (%s)", (char *) data);
 		return;
 	}
 
-	ServerInfo.specific_ipv6_vhost = 1;
-	ServerInfo.ip6.sin6_family = AF_INET6;
+	ServerInfo.bind6 = addr;
 #else
 	conf_report_error("Warning -- ignoring serverinfo::vhost6 -- IPv6 support not available.");
 #endif
@@ -288,8 +300,8 @@ conf_set_modules_module(void *data)
 
 	m_bn = rb_basename((char *) data);
 
-	if(findmodule_byname(m_bn) == -1)
-		load_one_module((char *) data, MAPI_ORIGIN_EXTENSION, 0);
+	if(findmodule_byname(m_bn) == NULL)
+		load_one_module((char *) data, MAPI_ORIGIN_EXTENSION, false);
 
 	rb_free(m_bn);
 }
@@ -327,22 +339,23 @@ static struct mode_table oper_table[] = {
 };
 
 static struct mode_table auth_table[] = {
-	{"encrypted",		CONF_FLAGS_ENCRYPTED	},
-	{"spoof_notice",	CONF_FLAGS_SPOOF_NOTICE	},
-	{"exceed_limit",	CONF_FLAGS_NOLIMIT	},
-	{"dnsbl_exempt",	CONF_FLAGS_EXEMPTDNSBL	},
-	{"kline_exempt",	CONF_FLAGS_EXEMPTKLINE	},
-	{"flood_exempt",	CONF_FLAGS_EXEMPTFLOOD	},
-	{"spambot_exempt",	CONF_FLAGS_EXEMPTSPAMBOT },
-	{"shide_exempt",	CONF_FLAGS_EXEMPTSHIDE	},
-	{"jupe_exempt",		CONF_FLAGS_EXEMPTJUPE	},
-	{"resv_exempt",		CONF_FLAGS_EXEMPTRESV	},
-	{"no_tilde",		CONF_FLAGS_NO_TILDE	},
-	{"need_ident",		CONF_FLAGS_NEED_IDENTD	},
-	{"have_ident",		CONF_FLAGS_NEED_IDENTD	},
-	{"need_ssl", 		CONF_FLAGS_NEED_SSL	},
-	{"need_sasl",		CONF_FLAGS_NEED_SASL	},
-	{"extend_chans",	CONF_FLAGS_EXTEND_CHANS	},
+	{"encrypted",		CONF_FLAGS_ENCRYPTED		},
+	{"spoof_notice",	CONF_FLAGS_SPOOF_NOTICE		},
+	{"exceed_limit",	CONF_FLAGS_NOLIMIT		},
+	{"dnsbl_exempt",	CONF_FLAGS_EXEMPTDNSBL		},
+	{"proxy_exempt",	CONF_FLAGS_EXEMPTPROXY		},
+	{"kline_exempt",	CONF_FLAGS_EXEMPTKLINE		},
+	{"flood_exempt",	CONF_FLAGS_EXEMPTFLOOD		},
+	{"spambot_exempt",	CONF_FLAGS_EXEMPTSPAMBOT	},
+	{"shide_exempt",	CONF_FLAGS_EXEMPTSHIDE		},
+	{"jupe_exempt",		CONF_FLAGS_EXEMPTJUPE		},
+	{"resv_exempt",		CONF_FLAGS_EXEMPTRESV		},
+	{"no_tilde",		CONF_FLAGS_NO_TILDE		},
+	{"need_ident",		CONF_FLAGS_NEED_IDENTD		},
+	{"have_ident",		CONF_FLAGS_NEED_IDENTD		},
+	{"need_ssl", 		CONF_FLAGS_NEED_SSL		},
+	{"need_sasl",		CONF_FLAGS_NEED_SASL		},
+	{"extend_chans",	CONF_FLAGS_EXTEND_CHANS		},
 	{NULL, 0}
 };
 
@@ -352,6 +365,7 @@ static struct mode_table connect_table[] = {
 	{ "encrypted",	SERVER_ENCRYPTED	},
 	{ "topicburst",	SERVER_TB		},
 	{ "ssl",	SERVER_SSL		},
+	{ "no-export",	SERVER_NO_EXPORT	},
 	{ NULL,		0			},
 };
 
@@ -375,9 +389,9 @@ static struct mode_table shared_table[] =
 	{ "kline",	SHARED_PKLINE|SHARED_TKLINE	},
 	{ "xline",	SHARED_PXLINE|SHARED_TXLINE	},
 	{ "resv",	SHARED_PRESV|SHARED_TRESV	},
-	{ "dline",  SHARED_PDLINE|SHARED_TDLINE },
-	{ "tdline", SHARED_TDLINE	},
-	{ "pdline", SHARED_PDLINE   },
+	{ "dline",	SHARED_PDLINE|SHARED_TDLINE	},
+	{ "tdline",	SHARED_TDLINE	},
+	{ "pdline",	SHARED_PDLINE   },
 	{ "undline",    SHARED_UNDLINE  },
 	{ "tkline",	SHARED_TKLINE	},
 	{ "unkline",	SHARED_UNKLINE	},
@@ -829,6 +843,8 @@ conf_begin_listen(struct TopConf *tc)
 {
 	rb_free(listener_address);
 	listener_address = NULL;
+	yy_wsock = 0;
+	yy_defer_accept = 0;
 	return 0;
 }
 
@@ -837,6 +853,8 @@ conf_end_listen(struct TopConf *tc)
 {
 	rb_free(listener_address);
 	listener_address = NULL;
+	yy_wsock = 0;
+	yy_defer_accept = 0;
 	return 0;
 }
 
@@ -844,6 +862,12 @@ static void
 conf_set_listen_defer_accept(void *data)
 {
 	yy_defer_accept = *(unsigned int *) data;
+}
+
+static void
+conf_set_listen_wsock(void *data)
+{
+	yy_wsock = *(unsigned int *) data;
 }
 
 static void
@@ -862,12 +886,12 @@ conf_set_listen_port_both(void *data, int ssl)
                 {
 			if (!ssl)
 			{
-				conf_report_warning("listener 'ANY/%d': support for plaintext listeners may be removed in a future release per RFC 7194.  "
+				conf_report_warning("listener 'ANY/%d': support for plaintext listeners may be removed in a future release per RFCs 7194 & 7258.  "
                                                     "It is suggested that users be migrated to SSL/TLS connections.", args->v.number);
 			}
-			add_listener(args->v.number, listener_address, AF_INET, ssl, ssl || yy_defer_accept);
+			add_listener(args->v.number, listener_address, AF_INET, ssl, ssl || yy_defer_accept, yy_wsock);
 #ifdef RB_IPV6
-			add_listener(args->v.number, listener_address, AF_INET6, ssl, ssl || yy_defer_accept);
+			add_listener(args->v.number, listener_address, AF_INET6, ssl, ssl || yy_defer_accept, yy_wsock);
 #endif
                 }
 		else
@@ -882,13 +906,12 @@ conf_set_listen_port_both(void *data, int ssl)
 
 			if (!ssl)
 			{
-				conf_report_warning("listener '%s/%d': support for plaintext listeners may be removed in a future release per RFC 7194.  "
+				conf_report_warning("listener '%s/%d': support for plaintext listeners may be removed in a future release per RFCs 7194 & 7258.  "
                                                     "It is suggested that users be migrated to SSL/TLS connections.", listener_address, args->v.number);
 			}
 
-			add_listener(args->v.number, listener_address, family, ssl, ssl || yy_defer_accept);
+			add_listener(args->v.number, listener_address, family, ssl, ssl || yy_defer_accept, yy_wsock);
                 }
-
 	}
 }
 
@@ -1288,7 +1311,19 @@ conf_end_connect(struct TopConf *tc)
 		return 0;
 	}
 
-	if(EmptyString(yy_server->host))
+	if((yy_server->flags & SERVER_SSL) && EmptyString(yy_server->certfp))
+	{
+		conf_report_error("Ignoring connect block for %s -- no fingerprint provided for SSL connection.",
+					yy_server->name);
+		return 0;
+	}
+
+	if(EmptyString(yy_server->connect_host)
+			&& GET_SS_FAMILY(&yy_server->connect4) != AF_INET
+#ifdef RB_IPV6
+			&& GET_SS_FAMILY(&yy_server->connect6) != AF_INET6
+#endif
+		)
 	{
 		conf_report_error("Ignoring connect block for %s -- missing host.",
 					yy_server->name);
@@ -1313,23 +1348,57 @@ conf_end_connect(struct TopConf *tc)
 static void
 conf_set_connect_host(void *data)
 {
-	rb_free(yy_server->host);
-	yy_server->host = rb_strdup(data);
-	if (strchr(yy_server->host, ':'))
-		yy_server->aftype = AF_INET6;
+	struct rb_sockaddr_storage addr;
+
+	if(rb_inet_pton_sock(data, (struct sockaddr *)&addr) <= 0)
+	{
+		rb_free(yy_server->connect_host);
+		yy_server->connect_host = rb_strdup(data);
+	}
+	else if(GET_SS_FAMILY(&addr) == AF_INET)
+	{
+		yy_server->connect4 = addr;
+	}
+#ifdef RB_IPV6
+	else if(GET_SS_FAMILY(&addr) == AF_INET6)
+	{
+		yy_server->connect6 = addr;
+	}
+#endif
+	else
+	{
+		conf_report_error("Unsupported IP address for server connect host (%s)",
+				  (char *)data);
+		return;
+	}
 }
 
 static void
 conf_set_connect_vhost(void *data)
 {
-	if(rb_inet_pton_sock(data, (struct sockaddr *)&yy_server->my_ipnum) <= 0)
+	struct rb_sockaddr_storage addr;
+
+	if(rb_inet_pton_sock(data, (struct sockaddr *)&addr) <= 0)
 	{
-		conf_report_error("Invalid IP address for server connect vhost (%s)",
-		    		  (char *) data);
+		rb_free(yy_server->bind_host);
+		yy_server->bind_host = rb_strdup(data);
+	}
+	else if(GET_SS_FAMILY(&addr) == AF_INET)
+	{
+		yy_server->bind4 = addr;
+	}
+#ifdef RB_IPV6
+	else if(GET_SS_FAMILY(&addr) == AF_INET6)
+	{
+		yy_server->bind6 = addr;
+	}
+#endif
+	else
+	{
+		conf_report_error("Unsupported IP address for server connect vhost (%s)",
+				  (char *)data);
 		return;
 	}
-
-	yy_server->flags |= SERVER_VHOSTED;
 }
 
 static void
@@ -1382,10 +1451,10 @@ conf_set_connect_aftype(void *data)
 {
 	char *aft = data;
 
-	if(strcasecmp(aft, "ipv4") == 0)
+	if(rb_strcasecmp(aft, "ipv4") == 0)
 		yy_server->aftype = AF_INET;
 #ifdef RB_IPV6
-	else if(strcasecmp(aft, "ipv6") == 0)
+	else if(rb_strcasecmp(aft, "ipv6") == 0)
 		yy_server->aftype = AF_INET6;
 #endif
 	else
@@ -1536,11 +1605,11 @@ conf_set_general_hide_error_messages(void *data)
 {
 	char *val = data;
 
-	if(strcasecmp(val, "yes") == 0)
+	if(rb_strcasecmp(val, "yes") == 0)
 		ConfigFileEntry.hide_error_messages = 2;
-	else if(strcasecmp(val, "opers") == 0)
+	else if(rb_strcasecmp(val, "opers") == 0)
 		ConfigFileEntry.hide_error_messages = 1;
-	else if(strcasecmp(val, "no") == 0)
+	else if(rb_strcasecmp(val, "no") == 0)
 		ConfigFileEntry.hide_error_messages = 0;
 	else
 		conf_report_error("Invalid setting '%s' for general::hide_error_messages.", val);
@@ -1560,11 +1629,11 @@ conf_set_general_stats_k_oper_only(void *data)
 {
 	char *val = data;
 
-	if(strcasecmp(val, "yes") == 0)
+	if(rb_strcasecmp(val, "yes") == 0)
 		ConfigFileEntry.stats_k_oper_only = 2;
-	else if(strcasecmp(val, "masked") == 0)
+	else if(rb_strcasecmp(val, "masked") == 0)
 		ConfigFileEntry.stats_k_oper_only = 1;
-	else if(strcasecmp(val, "no") == 0)
+	else if(rb_strcasecmp(val, "no") == 0)
 		ConfigFileEntry.stats_k_oper_only = 0;
 	else
 		conf_report_error("Invalid setting '%s' for general::stats_k_oper_only.", val);
@@ -1575,11 +1644,11 @@ conf_set_general_stats_i_oper_only(void *data)
 {
 	char *val = data;
 
-	if(strcasecmp(val, "yes") == 0)
+	if(rb_strcasecmp(val, "yes") == 0)
 		ConfigFileEntry.stats_i_oper_only = 2;
-	else if(strcasecmp(val, "masked") == 0)
+	else if(rb_strcasecmp(val, "masked") == 0)
 		ConfigFileEntry.stats_i_oper_only = 1;
-	else if(strcasecmp(val, "no") == 0)
+	else if(rb_strcasecmp(val, "no") == 0)
 		ConfigFileEntry.stats_i_oper_only = 0;
 	else
 		conf_report_error("Invalid setting '%s' for general::stats_i_oper_only.", val);
@@ -1654,15 +1723,19 @@ conf_set_general_certfp_method(void *data)
 {
 	char *method = data;
 
-	if (!strcasecmp(method, "sha1"))
-		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA1;
-	else if (!strcasecmp(method, "sha256"))
-		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA256;
-	else if (!strcasecmp(method, "sha512"))
-		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA512;
+	if (!rb_strcasecmp(method, CERTFP_NAME_CERT_SHA1))
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA1;
+	else if (!rb_strcasecmp(method, CERTFP_NAME_CERT_SHA256))
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA256;
+	else if (!rb_strcasecmp(method, CERTFP_NAME_CERT_SHA512))
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA512;
+	else if (!rb_strcasecmp(method, CERTFP_NAME_SPKI_SHA256))
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SPKI_SHA256;
+	else if (!rb_strcasecmp(method, CERTFP_NAME_SPKI_SHA512))
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SPKI_SHA512;
 	else
 	{
-		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_SHA1;
+		ConfigFileEntry.certfp_method = RB_SSL_CERTFP_METH_CERT_SHA1;
 		conf_report_error("Ignoring general::certfp_method -- bogus certfp method %s", method);
 	}
 }
@@ -1750,7 +1823,6 @@ conf_begin_alias(struct TopConf *tc)
 		yy_alias->name = rb_strdup(conf_cur_block_name);
 
 	yy_alias->flags = 0;
-	yy_alias->hits = 0;
 
 	return 0;
 }
@@ -1841,6 +1913,9 @@ conf_set_channel_autochanmodes(void *data)
 /* XXX for below */
 static void conf_set_blacklist_reason(void *data);
 
+#define IPTYPE_IPV4 1
+#define IPTYPE_IPV6 2
+
 static void
 conf_set_blacklist_host(void *data)
 {
@@ -1854,8 +1929,7 @@ conf_set_blacklist_host(void *data)
 		return;
 	}
 
-	yy_blacklist_ipv4 = 1;
-	yy_blacklist_ipv6 = 0;
+	yy_blacklist_iptype |= IPTYPE_IPV4;
 	yy_blacklist_host = rb_strdup(data);
 }
 
@@ -1865,25 +1939,24 @@ conf_set_blacklist_type(void *data)
 	conf_parm_t *args = data;
 
 	/* Don't assume we have either if we got here */
-	yy_blacklist_ipv4 = 0;
-	yy_blacklist_ipv6 = 0;
+	yy_blacklist_iptype = 0;
 
 	for (; args; args = args->next)
 	{
-		if (!strcasecmp(args->v.string, "ipv4"))
-			yy_blacklist_ipv4 = 1;
-		else if (!strcasecmp(args->v.string, "ipv6"))
-			yy_blacklist_ipv6 = 1;
+		if (!rb_strcasecmp(args->v.string, "ipv4"))
+			yy_blacklist_iptype |= IPTYPE_IPV4;
+		else if (!rb_strcasecmp(args->v.string, "ipv6"))
+			yy_blacklist_iptype |= IPTYPE_IPV6;
 		else
 			conf_report_error("blacklist::type has unknown address family %s",
 					  args->v.string);
 	}
 
 	/* If we have neither, just default to IPv4 */
-	if (!yy_blacklist_ipv4 && !yy_blacklist_ipv6)
+	if (!yy_blacklist_iptype)
 	{
-		conf_report_error("blacklist::type has neither IPv4 nor IPv6 (defaulting to IPv4)");
-		yy_blacklist_ipv4 = 1;
+		conf_report_warning("blacklist::type has neither IPv4 nor IPv6 (defaulting to IPv4)");
+		yy_blacklist_iptype = IPTYPE_IPV4;
 	}
 }
 
@@ -1891,13 +1964,13 @@ static void
 conf_set_blacklist_matches(void *data)
 {
 	conf_parm_t *args = data;
+	enum filter_t { FILTER_NONE, FILTER_ALL, FILTER_LAST };
 
 	for (; args; args = args->next)
 	{
-		struct BlacklistFilter *filter;
 		char *str = args->v.string;
 		char *p;
-		int type = BLACKLIST_FILTER_LAST;
+		enum filter_t type = FILTER_LAST;
 
 		if (CF_TYPE(args->type) != CF_QSTRING)
 		{
@@ -1922,17 +1995,17 @@ conf_set_blacklist_matches(void *data)
 		{
 			/* Check for validity */
 			if (*p == '.')
-				type = BLACKLIST_FILTER_ALL;
-			else if (!isalnum((unsigned char)*p))
+				type = FILTER_ALL;
+			else if (!isdigit((unsigned char)*p))
 			{
 				conf_report_error("blacklist::matches has invalid IP match entry %s",
 						str);
-				type = 0;
+				type = FILTER_NONE;
 				break;
 			}
 		}
 
-		if (type == BLACKLIST_FILTER_ALL)
+		if (type == FILTER_ALL)
 		{
 			/* Basic IP sanity check */
 			struct rb_sockaddr_storage tmp;
@@ -1943,7 +2016,7 @@ conf_set_blacklist_matches(void *data)
 				continue;
 			}
 		}
-		else if (type == BLACKLIST_FILTER_LAST)
+		else if (type == FILTER_LAST)
 		{
 			/* Verify it's the correct length */
 			if (strlen(str) > 3)
@@ -1958,11 +2031,7 @@ conf_set_blacklist_matches(void *data)
 			continue; /* Invalid entry */
 		}
 
-		filter = rb_malloc(sizeof(struct BlacklistFilter));
-		filter->type = type;
-		rb_strlcpy(filter->filterstr, str, sizeof(filter->filterstr));
-
-		rb_dlinkAdd(filter, &filter->node, &yy_blacklist_filters);
+		rb_dlinkAddAlloc(rb_strdup(str), &yy_blacklist_filters);
 	}
 }
 
@@ -1974,9 +2043,11 @@ conf_set_blacklist_reason(void *data)
 	if (yy_blacklist_host && data)
 	{
 		yy_blacklist_reason = rb_strdup(data);
-		if (yy_blacklist_ipv6)
+		if (yy_blacklist_iptype & IPTYPE_IPV6)
 		{
-			/* Make sure things fit (64 = alnum count + dots) */
+			/* Make sure things fit (magic number 64 = alnum count + dots)
+			 * Example: 1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa
+			 */
 			if ((64 + strlen(yy_blacklist_host)) > IRCD_RES_HOSTLEN)
 			{
 				conf_report_error("blacklist::host %s results in IPv6 queries that are too long",
@@ -1985,9 +2056,11 @@ conf_set_blacklist_reason(void *data)
 			}
 		}
 		/* Avoid doing redundant check, IPv6 is bigger than IPv4 --Elizabeth */
-		if (yy_blacklist_ipv4 && !yy_blacklist_ipv6)
+		if ((yy_blacklist_iptype & IPTYPE_IPV4) && !(yy_blacklist_iptype & IPTYPE_IPV6))
 		{
-			/* Make sure things fit (16 = number of nums + dots) */
+			/* Make sure things fit for worst case (magic number 16 = number of nums + dots)
+			 * Example: 127.127.127.127.in-addr.arpa
+			 */
 			if ((16 + strlen(yy_blacklist_host)) > IRCD_RES_HOSTLEN)
 			{
 				conf_report_error("blacklist::host %s results in IPv4 queries that are too long",
@@ -1996,30 +2069,322 @@ conf_set_blacklist_reason(void *data)
 			}
 		}
 
-		new_blacklist(yy_blacklist_host, yy_blacklist_reason, yy_blacklist_ipv4, yy_blacklist_ipv6,
-				&yy_blacklist_filters);
+		add_blacklist(yy_blacklist_host, yy_blacklist_reason, yy_blacklist_iptype, &yy_blacklist_filters);
 	}
 
 cleanup_bl:
-	if (data == NULL)
+	RB_DLINK_FOREACH_SAFE(ptr, nptr, yy_blacklist_filters.head)
 	{
-		RB_DLINK_FOREACH_SAFE(ptr, nptr, yy_blacklist_filters.head)
-		{
-			rb_dlinkDelete(ptr, &yy_blacklist_filters);
-			rb_free(ptr);
-		}
+		rb_free(ptr->data);
+		rb_dlinkDestroy(ptr, &yy_blacklist_filters);
 	}
-	else
-	{
-		yy_blacklist_filters = (rb_dlink_list){ NULL, NULL, 0 };
-	}
+
+	yy_blacklist_filters = (rb_dlink_list){ NULL, NULL, 0 };
 
 	rb_free(yy_blacklist_host);
 	rb_free(yy_blacklist_reason);
 	yy_blacklist_host = NULL;
 	yy_blacklist_reason = NULL;
-	yy_blacklist_ipv4 = 1;
-	yy_blacklist_ipv6 = 0;
+	yy_blacklist_iptype = 0;
+}
+
+
+struct opm_scanner
+{
+	const char *type;
+	uint16_t port;
+
+	rb_dlink_node node;
+};
+
+static int
+conf_begin_opm(struct TopConf *tc)
+{
+	yy_opm_address_ipv4 = yy_opm_address_ipv6 = NULL;
+	yy_opm_port_ipv4 = yy_opm_port_ipv6 = yy_opm_timeout = 0;
+	delete_opm_proxy_scanner_all();
+	delete_opm_listener_all();
+	return 0;
+}
+
+static int
+conf_end_opm(struct TopConf *tc)
+{
+	rb_dlink_node *ptr, *nptr;
+	bool fail = false;
+
+	if(rb_dlink_list_length(&yy_opm_scanner_list) == 0)
+	{
+		conf_report_error("No opm scanners configured -- disabling opm.");
+		fail = true;
+		goto end;
+	}
+
+	if(yy_opm_port_ipv4 > 0)
+	{
+		if(yy_opm_address_ipv4 != NULL)
+			conf_create_opm_listener(yy_opm_address_ipv4, yy_opm_port_ipv4);
+		else
+		{
+			char ip[HOSTIPLEN];
+			if(!rb_inet_ntop_sock((struct sockaddr *)&ServerInfo.bind4, ip, sizeof(ip)))
+				conf_report_error("No opm::listen_ipv4 nor serverinfo::vhost directive; cannot listen on IPv4");
+			else
+				conf_create_opm_listener(ip, yy_opm_port_ipv4);
+		}
+	}
+
+	if(yy_opm_port_ipv6 > 0)
+	{
+		if(yy_opm_address_ipv6 != NULL)
+			conf_create_opm_listener(yy_opm_address_ipv6, yy_opm_port_ipv6);
+		else
+		{
+			char ip[HOSTIPLEN];
+			if(!rb_inet_ntop_sock((struct sockaddr *)&ServerInfo.bind6, ip, sizeof(ip)))
+				conf_report_error("No opm::listen_ipv6 nor serverinfo::vhost directive; cannot listen on IPv6");
+			else
+				conf_create_opm_listener(ip, yy_opm_port_ipv6);
+		}
+	}
+
+	/* If there's no listeners... */
+	fail = (yy_opm_port_ipv4 == 0 || yy_opm_port_ipv6 == 0);
+	if(!fail && yy_opm_timeout > 0 && yy_opm_timeout < 60)
+		/* Send timeout */
+		set_authd_timeout("opm_timeout", yy_opm_timeout);
+	else if(fail)
+		conf_report_error("No opm listeners -- disabling");
+	else if(yy_opm_timeout <= 0 || yy_opm_timeout >= 60)
+		conf_report_error("opm::timeout value is invalid -- ignoring");
+
+end:
+	RB_DLINK_FOREACH_SAFE(ptr, nptr, yy_opm_scanner_list.head)
+	{
+		struct opm_scanner *scanner = ptr->data;
+
+		if(!fail)
+			create_opm_proxy_scanner(scanner->type, scanner->port);
+
+		rb_dlinkDelete(&scanner->node, &yy_opm_scanner_list);
+		rb_free(scanner);
+	}
+
+	if(!fail)
+		opm_check_enable(true);
+
+	rb_free(yy_opm_address_ipv4);
+	rb_free(yy_opm_address_ipv6);
+	return 0;
+}
+
+static void
+conf_set_opm_timeout(void *data)
+{
+	int timeout = *((int *)data);
+
+	if(timeout <= 0 || timeout > 60)
+	{
+		conf_report_error("opm::timeout value %d is bogus, ignoring", timeout);
+		return;
+	}
+
+	yy_opm_timeout = timeout;
+}
+
+static void
+conf_set_opm_listen_address_both(void *data, bool ipv6)
+{
+	struct rb_sockaddr_storage addr;
+	const char *confstr = (ipv6 ? "opm::listen_ipv6" : "opm::listen_ipv4");
+	char *ip = data;
+
+	if(!rb_inet_pton_sock(ip, (struct sockaddr *)&addr))
+	{
+		conf_report_error("%s is an invalid address: %s", confstr, ip);
+		return;
+	}
+
+	if(ipv6)
+	{
+#ifdef RB_IPV6
+		if(GET_SS_FAMILY(&addr) != AF_INET6)
+		{
+			conf_report_error("%s is of the wrong address type: %s", confstr, ip);
+			return;
+		}
+
+		if(yy_opm_address_ipv6 != NULL)
+		{
+			conf_report_error("%s overwrites previous address %s", confstr, ip);
+			return;
+		}
+
+		yy_opm_address_ipv6 = rb_strdup(ip);
+#else
+		conf_report_error("%s requires IPv6 support in your ircd", confstr, ip);
+		return;
+#endif
+	}
+	else
+	{
+		if(GET_SS_FAMILY(&addr) != AF_INET)
+		{
+			conf_report_error("%s is of the wrong address type: %s", confstr, ip);
+			return;
+		}
+
+		if(yy_opm_address_ipv4 != NULL)
+		{
+			conf_report_error("%s overwrites previous address %s", confstr, ip);
+			return;
+		}
+
+		yy_opm_address_ipv4 = rb_strdup(ip);
+	}
+}
+
+static void
+conf_set_opm_listen_address_ipv4(void *data)
+{
+	conf_set_opm_listen_address_both(data, false);
+}
+
+static void
+conf_set_opm_listen_address_ipv6(void *data)
+{
+	conf_set_opm_listen_address_both(data, true);
+}
+
+static void
+conf_set_opm_listen_port_both(void *data, bool ipv6)
+{
+	int port = *((int *)data);
+	const char *confstr = (ipv6 ? "opm::port_ipv6" : "opm::port_ipv4");
+
+#ifndef RB_IPV6
+	if(ipv6)
+	{
+		conf_report_error("%s requires IPv6 support in your ircd", confstr);
+		return;
+	}
+#endif
+
+	if(port > 65535 || port <= 0)
+	{
+		conf_report_error("%s is out of range: %d", confstr, port);
+		return;
+	}
+
+	if(ipv6)
+	{
+		if(yy_opm_port_ipv4)
+		{
+			conf_report_error("%s overwrites existing port %hu",
+					confstr, yy_opm_port_ipv4);
+			return;
+		}
+
+		yy_opm_port_ipv4 = port;
+	}
+	else
+	{
+		if(yy_opm_port_ipv6)
+		{
+			conf_report_error("%s overwrites existing port %hu",
+					confstr, yy_opm_port_ipv6);
+			return;
+		}
+
+		yy_opm_port_ipv6 = port;
+	}
+}
+
+static void
+conf_set_opm_listen_port_ipv4(void *data)
+{
+	conf_set_opm_listen_port_both(data, false);
+}
+
+static void
+conf_set_opm_listen_port_ipv6(void *data)
+{
+	conf_set_opm_listen_port_both(data, true);
+}
+
+static void
+conf_set_opm_listen_port(void *data)
+{
+	conf_set_opm_listen_port_both(data, true);
+	conf_set_opm_listen_port_both(data, false);
+}
+
+static void
+conf_set_opm_scan_ports_all(void *data, const char *node, const char *type)
+{
+	conf_parm_t *args = data;
+	for (; args; args = args->next)
+	{
+		rb_dlink_node *ptr;
+		bool dup = false;
+
+		if(CF_TYPE(args->type) != CF_INT)
+		{
+			conf_report_error("%s argument is not an integer -- ignoring.", node);
+			continue;
+		}
+
+		if(args->v.number > 65535 || args->v.number <= 0)
+		{
+			conf_report_error("%s argument is not an integer between 1 and 65535 -- ignoring.", node);
+			continue;
+		}
+
+		/* Check for duplicates */
+		RB_DLINK_FOREACH(ptr, yy_opm_scanner_list.head)
+		{
+			struct opm_scanner *scanner = ptr->data;
+
+			if(scanner->port == args->v.number && strcmp(type, scanner->type) == 0)
+			{
+				conf_report_error("%s argument is duplicate", node);
+				dup = true;
+				break;
+			}
+		}
+
+		if(!dup)
+		{
+			struct opm_scanner *scanner = rb_malloc(sizeof(struct opm_scanner));
+			scanner->port = args->v.number;
+			scanner->type = type;
+			rb_dlinkAdd(scanner, &scanner->node, &yy_opm_scanner_list);
+		}
+	}
+}
+
+static void
+conf_set_opm_scan_ports_socks4(void *data)
+{
+	conf_set_opm_scan_ports_all(data, "opm::socks4_ports", "socks4");
+}
+
+static void
+conf_set_opm_scan_ports_socks5(void *data)
+{
+	conf_set_opm_scan_ports_all(data, "opm::socks5_ports", "socks5");
+}
+
+static void
+conf_set_opm_scan_ports_httpconnect(void *data)
+{
+	conf_set_opm_scan_ports_all(data, "opm::httpconnect_ports", "httpconnect");
+}
+
+static void
+conf_set_opm_scan_ports_httpsconnect(void *data)
+{
+	conf_set_opm_scan_ports_all(data, "opm::httpsconnect_ports", "httpsconnect");
 }
 
 /* public functions */
@@ -2129,7 +2494,7 @@ conf_call_set(struct TopConf *tc, char *item, conf_parm_t * value)
 	if((cf = find_conf_item(tc, item)) == NULL)
 	{
 		conf_report_error
-			("Non-existant configuration setting %s::%s.", tc->tc_name, (char *) item);
+			("Non-existent configuration setting %s::%s.", tc->tc_name, (char *) item);
 		return -1;
 	}
 
@@ -2514,6 +2879,7 @@ newconf_init()
 
 	add_top_conf("listen", conf_begin_listen, conf_end_listen, NULL);
 	add_conf_item("listen", "defer_accept", CF_YESNO, conf_set_listen_defer_accept);
+	add_conf_item("listen", "wsock", CF_YESNO, conf_set_listen_wsock);
 	add_conf_item("listen", "port", CF_INT | CF_FLIST, conf_set_listen_port);
 	add_conf_item("listen", "sslport", CF_INT | CF_FLIST, conf_set_listen_sslport);
 	add_conf_item("listen", "ip", CF_QSTRING, conf_set_listen_address);
@@ -2550,4 +2916,16 @@ newconf_init()
 	add_conf_item("blacklist", "type", CF_STRING | CF_FLIST, conf_set_blacklist_type);
 	add_conf_item("blacklist", "matches", CF_QSTRING | CF_FLIST, conf_set_blacklist_matches);
 	add_conf_item("blacklist", "reject_reason", CF_QSTRING, conf_set_blacklist_reason);
+
+	add_top_conf("opm", conf_begin_opm, conf_end_opm, NULL);
+	add_conf_item("opm", "timeout", CF_INT, conf_set_opm_timeout);
+	add_conf_item("opm", "listen_ipv4", CF_QSTRING, conf_set_opm_listen_address_ipv4);
+	add_conf_item("opm", "listen_ipv6", CF_QSTRING, conf_set_opm_listen_address_ipv6);
+	add_conf_item("opm", "port_v4", CF_INT, conf_set_opm_listen_port_ipv4);
+	add_conf_item("opm", "port_v6", CF_INT, conf_set_opm_listen_port_ipv6);
+	add_conf_item("opm", "listen_port", CF_INT, conf_set_opm_listen_port);
+	add_conf_item("opm", "socks4_ports", CF_INT | CF_FLIST, conf_set_opm_scan_ports_socks4);
+	add_conf_item("opm", "socks5_ports", CF_INT | CF_FLIST, conf_set_opm_scan_ports_socks5);
+	add_conf_item("opm", "httpconnect_ports", CF_INT | CF_FLIST, conf_set_opm_scan_ports_httpconnect);
+	add_conf_item("opm", "httpsconnect_ports", CF_INT | CF_FLIST, conf_set_opm_scan_ports_httpsconnect);
 }

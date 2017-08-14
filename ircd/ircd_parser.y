@@ -58,8 +58,8 @@ time_t conf_find_time(char *name)
 
   for (i = 0; ircd_times[i].name; i++)
     {
-      if (strcasecmp(ircd_times[i].name, name) == 0 ||
-	  (ircd_times[i].plural && strcasecmp(ircd_times[i].plural, name) == 0))
+      if (rb_strcasecmp(ircd_times[i].name, name) == 0 ||
+	  (ircd_times[i].plural && rb_strcasecmp(ircd_times[i].plural, name) == 0))
 	return ircd_times[i].val;
     }
 
@@ -86,7 +86,7 @@ static int	conf_get_yesno_value(char *str)
 
 	for (i = 0; yesno[i].word; i++)
 	{
-		if (strcasecmp(str, yesno[i].word) == 0)
+		if (rb_strcasecmp(str, yesno[i].word) == 0)
 		{
 			return yesno[i].yesno;
 		}
@@ -160,7 +160,7 @@ static void	add_cur_list(int type, char *str, int number)
 
 %union {
 	int		number;
-	char		string[BUFSIZE + 1];
+	char		string[1024];
 	conf_parm_t *	conf_parm;
 }
 
@@ -291,7 +291,7 @@ loadmodule:
                 char *m_bn;
                 m_bn = rb_basename((char *) $2);
 
-                if (findmodule_byname(m_bn) == -1)
+                if (findmodule_byname(m_bn) == NULL)
 	        {
 	            load_one_module($2, MAPI_ORIGIN_EXTENSION, 0);
 		}

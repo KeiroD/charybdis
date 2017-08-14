@@ -27,10 +27,6 @@
  * #define PATRICIA_DEBUG 1
  */
 
-#define PREFIX_HEAP_COUNT	1024
-#define NODE_HEAP_COUNT		1024
-#define PATRICIA_HEAP_COUNT	128
-
 void
 rb_init_patricia(void)
 {
@@ -56,7 +52,7 @@ comp_with_mask(void *addr, void *dest, unsigned int mask)
 	if( /* mask/8 == 0 || */ memcmp(addr, dest, mask / 8) == 0)
 	{
 		int n = mask / 8;
-		int m = ((-1) << (8 - (mask % 8)));
+		uint8_t m = (0xFF << (8 - (mask % 8)));
 
 		if(mask % 8 == 0 || (((uint8_t *)addr)[n] & m) == (((uint8_t *)dest)[n] & m))
 			return (1);

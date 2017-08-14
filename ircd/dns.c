@@ -36,6 +36,7 @@
 #include "numeric.h"
 #include "msg.h"
 #include "hash.h"
+#include "s_assert.h"
 
 #define DNS_HOST_IPV4		((char)'4')
 #define DNS_HOST_IPV6		((char)'6')
@@ -66,8 +67,15 @@ rb_dlink_list nameservers;
 static uint32_t query_id = 0;
 static uint32_t stat_id = 0;
 
-#define ASSIGN_ID(id) (id++)
 
+static inline uint32_t
+assign_id(uint32_t *id)
+{
+	if(++(*id) == 0)
+		*id = 1;
+
+	return *id;
+}
 
 static void
 handle_dns_failure(uint32_t xid)
@@ -75,7 +83,7 @@ handle_dns_failure(uint32_t xid)
 	struct dnsreq *req = rb_dictionary_retrieve(query_dict, RB_UINT_TO_POINTER(xid));
 	s_assert(req);
 
-	if(req->callback == NULL)
+	if(req == NULL || req->callback == NULL)
 		return;
 
 	req->callback("FAILED", 0, 0, req->data);
@@ -89,7 +97,7 @@ handle_dns_stat_failure(uint32_t xid)
 	struct dnsstatreq *req = rb_dictionary_retrieve(stat_dict, RB_UINT_TO_POINTER(xid));
 	s_assert(req);
 
-	if(req->callback == NULL)
+	if(req == NULL || req->callback == NULL)
 		return;
 
 	req->callback(1, NULL, 2, req->data);
@@ -103,6 +111,10 @@ cancel_lookup(uint32_t xid)
 {
 	struct dnsreq *req = rb_dictionary_retrieve(query_dict, RB_UINT_TO_POINTER(xid));
 	s_assert(req);
+
+	if (req == NULL)
+		return;
+
 	req->callback = NULL;
 	req->data = NULL;
 }
@@ -112,6 +124,10 @@ cancel_dns_stats(uint32_t xid)
 {
 	struct dnsstatreq *req = rb_dictionary_retrieve(stat_dict, RB_UINT_TO_POINTER(xid));
 	s_assert(req);
+
+	if (req == NULL)
+		return;
+
 	req->callback = NULL;
 	req->data = NULL;
 }
@@ -122,7 +138,7 @@ lookup_hostname(const char *hostname, int aftype, DNSCB callback, void *data)
 {
 	struct dnsreq *req = rb_malloc(sizeof(struct dnsreq));
 	int aft;
-	uint32_t rid = ASSIGN_ID(query_id);
+	uint32_t rid = assign_id(&query_id);
 
 	check_authd();
 
@@ -147,7 +163,7 @@ lookup_ip(const char *addr, int aftype, DNSCB callback, void *data)
 {
 	struct dnsreq *req = rb_malloc(sizeof(struct dnsreq));
 	int aft;
-	uint32_t rid = ASSIGN_ID(query_id);
+	uint32_t rid = assign_id(&query_id);
 
 	check_authd();
 
@@ -167,11 +183,11 @@ lookup_ip(const char *addr, int aftype, DNSCB callback, void *data)
 	return (rid);
 }
 
-uint32_t
+static uint32_t
 get_nameservers(DNSLISTCB callback, void *data)
 {
 	struct dnsstatreq *req = rb_malloc(sizeof(struct dnsstatreq));
-	uint32_t qid = ASSIGN_ID(stat_id);
+	uint32_t qid = assign_id(&stat_id);
 
 	check_authd();
 
@@ -238,6 +254,8 @@ dns_stats_results_callback(const char *callid, const char *status, int resc, con
 	req = rb_dictionary_retrieve(stat_dict, RB_UINT_TO_POINTER(qid));
 
 	s_assert(req);
+	if (req == NULL)
+		return;
 
 	if(req->callback == NULL)
 	{
@@ -285,7 +303,7 @@ stats_results_callback(int resc, const char *resv[], int status, void *data)
 	}
 	else
 	{
-		const char *error = resc ? resv[resc] : "Unknown error";
+		const char *error = resc ? resv[resc - 1] : "Unknown error";
 		iwarn("Error getting DNS servers: %s", error);
 	}
 }
@@ -303,7 +321,7 @@ void
 reload_nameservers(void)
 {
 	check_authd();
-	rb_helper_write(authd_helper, "H D");
+	rb_helper_write(authd_helper, "R D");
 	(void)get_nameservers(stats_results_callback, NULL);
 }
 

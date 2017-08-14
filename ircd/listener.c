@@ -34,18 +34,14 @@
 #include "s_newconf.h"
 #include "s_stats.h"
 #include "send.h"
-#include "s_auth.h"
+#include "authproc.h"
 #include "reject.h"
-#include "s_conf.h"
 #include "hostmask.h"
 #include "sslproc.h"
+#include "wsproc.h"
 #include "hash.h"
 #include "s_assert.h"
 #include "logger.h"
-
-#ifndef INADDR_NONE
-#define INADDR_NONE ((unsigned int) 0xffffffff)
-#endif
 
 #if defined(NO_IN6ADDR_ANY) && defined(RB_IPV6)
 static const struct in6_addr in6addr_any =
@@ -55,6 +51,7 @@ static const struct in6_addr in6addr_any =
 static struct Listener *ListenerPollList = NULL;
 static int accept_precallback(rb_fde_t *F, struct sockaddr *addr, rb_socklen_t addrlen, void *data);
 static void accept_callback(rb_fde_t *F, int status, struct sockaddr *addr, rb_socklen_t addrlen, void *data);
+static SSL_OPEN_CB accept_sslcallback;
 
 static struct Listener *
 make_listener(struct rb_sockaddr_storage *addr)
@@ -105,12 +102,7 @@ free_listener(struct Listener *listener)
 static uint16_t
 get_listener_port(const struct Listener *listener)
 {
-#ifdef RB_IPV6
-	if(GET_SS_FAMILY(&listener->addr) == AF_INET6)
-		return ntohs(((const struct sockaddr_in6 *)&listener->addr)->sin6_port);
-	else
-#endif
-		return ntohs(((const struct sockaddr_in *)&listener->addr)->sin_port);
+	return ntohs(GET_SS_PORT(&listener->addr));
 }
 
 /*
@@ -157,14 +149,7 @@ show_ports(struct Client *source_p)
  * inetport - create a listener socket in the AF_INET or AF_INET6 domain,
  * bind it to the port given in 'port' and listen to it
  * returns true (1) if successful false (0) on error.
- *
- * If the operating system has a define for SOMAXCONN, use it, otherwise
- * use CHARYBDIS_SOMAXCONN
  */
-#ifdef SOMAXCONN
-#undef CHARYBDIS_SOMAXCONN
-#define CHARYBDIS_SOMAXCONN SOMAXCONN
-#endif
 
 static int
 inetport(struct Listener *listener)
@@ -223,6 +208,8 @@ inetport(struct Listener *listener)
 	/*
 	 * XXX - we don't want to do all this crap for a listener
 	 * set_sock_opts(listener);
+	 *
+	 * FIXME - doesn't this belong in librb? --Elizafox
 	 */
 	if(setsockopt(rb_get_fd(F), SOL_SOCKET, SO_REUSEADDR, (char *) &opt, sizeof(opt)))
 	{
@@ -236,11 +223,7 @@ inetport(struct Listener *listener)
 		return 0;
 	}
 
-	/*
-	 * Bind a port to listen for new connections if port is non-null,
-	 * else assume it is already open and try get something from it.
-	 */
-
+	/* FIXME - doesn't this belong in librb? --Elizafox */
 	if(bind(rb_get_fd(F), (struct sockaddr *) &listener->addr, GET_SS_LEN(&listener->addr)))
 	{
 		errstr = strerror(rb_get_sockerr(F));
@@ -253,7 +236,7 @@ inetport(struct Listener *listener)
 		return 0;
 	}
 
-	if(rb_listen(F, CHARYBDIS_SOMAXCONN, listener->defer_accept))
+	if(rb_listen(F, SOMAXCONN, listener->defer_accept))
 	{
 		errstr = strerror(rb_get_sockerr(F));
 		sendto_realops_snomask(SNO_GENERAL, L_ALL,
@@ -331,7 +314,7 @@ find_listener(struct rb_sockaddr_storage *addr)
  * the format "255.255.255.255"
  */
 void
-add_listener(int port, const char *vhost_ip, int family, int ssl, int defer_accept)
+add_listener(int port, const char *vhost_ip, int family, int ssl, int defer_accept, int wsock)
 {
 	struct Listener *listener;
 	struct rb_sockaddr_storage vaddr;
@@ -379,12 +362,14 @@ add_listener(int port, const char *vhost_ip, int family, int ssl, int defer_acce
 	{
 		case AF_INET:
 			SET_SS_LEN(&vaddr, sizeof(struct sockaddr_in));
-			((struct sockaddr_in *)&vaddr)->sin_port = htons(port);
+			SET_SS_FAMILY(&vaddr, AF_INET);
+			SET_SS_PORT(&vaddr, htons(port));
 			break;
 #ifdef RB_IPV6
 		case AF_INET6:
 			SET_SS_LEN(&vaddr, sizeof(struct sockaddr_in6));
-			((struct sockaddr_in6 *)&vaddr)->sin6_port = htons(port);
+			SET_SS_FAMILY(&vaddr, AF_INET6);
+			SET_SS_PORT(&vaddr, htons(port));
 			break;
 #endif
 		default:
@@ -405,6 +390,7 @@ add_listener(int port, const char *vhost_ip, int family, int ssl, int defer_acce
 	listener->F = NULL;
 	listener->ssl = ssl;
 	listener->defer_accept = defer_accept;
+	listener->wsock = wsock;
 
 	if(inetport(listener))
 		listener->active = 1;
@@ -453,8 +439,6 @@ close_listeners()
 	}
 }
 
-#define DLINE_WARNING "ERROR :You have been D-lined.\r\n"
-
 /*
  * add_connection - creates a client which has just connected to us on
  * the given fd. The sockhost field is initialized with the ip# of the host.
@@ -465,6 +449,7 @@ static void
 add_connection(struct Listener *listener, rb_fde_t *F, struct sockaddr *sai, struct sockaddr *lai)
 {
 	struct Client *new_client;
+	bool defer = false;
 	s_assert(NULL != listener);
 
 	/*
@@ -472,24 +457,7 @@ add_connection(struct Listener *listener, rb_fde_t *F, struct sockaddr *sai, str
 	 * the client has already been checked out in accept_connection
 	 */
 	new_client = make_client(NULL);
-
-	if (listener->ssl)
-	{
-		rb_fde_t *xF[2];
-		if(rb_socketpair(AF_UNIX, SOCK_STREAM, 0, &xF[0], &xF[1], "Incoming ssld Connection") == -1)
-		{
-			free_client(new_client);
-			return;
-		}
-		new_client->localClient->ssl_ctl = start_ssld_accept(F, xF[1], new_client->localClient->connid);        /* this will close F for us */
-		if(new_client->localClient->ssl_ctl == NULL)
-		{
-			free_client(new_client);
-			return;
-		}
-		F = xF[0];
-		SetSSL(new_client);
-	}
+	new_client->localClient->F = F;
 
 	memcpy(&new_client->localClient->ip, sai, sizeof(struct rb_sockaddr_storage));
 	memcpy(&new_client->preClient->lip, lai, sizeof(struct rb_sockaddr_storage));
@@ -501,15 +469,63 @@ add_connection(struct Listener *listener, rb_fde_t *F, struct sockaddr *sai, str
 	rb_inet_ntop_sock((struct sockaddr *)&new_client->localClient->ip, new_client->sockhost,
 		sizeof(new_client->sockhost));
 
-
 	rb_strlcpy(new_client->host, new_client->sockhost, sizeof(new_client->host));
 
-	new_client->localClient->F = F;
+	if (listener->ssl)
+	{
+		rb_fde_t *xF[2];
+		if(rb_socketpair(AF_UNIX, SOCK_STREAM, 0, &xF[0], &xF[1], "Incoming ssld Connection") == -1)
+		{
+			SetIOError(new_client);
+			exit_client(new_client, new_client, new_client, "Fatal Error");
+			return;
+		}
+		new_client->localClient->ssl_callback = accept_sslcallback;
+		defer = true;
+		new_client->localClient->ssl_ctl = start_ssld_accept(F, xF[1], connid_get(new_client));        /* this will close F for us */
+		if(new_client->localClient->ssl_ctl == NULL)
+		{
+			SetIOError(new_client);
+			exit_client(new_client, new_client, new_client, "Service Unavailable");
+			return;
+		}
+		F = xF[0];
+		new_client->localClient->F = F;
+		SetSSL(new_client);
+	}
+
+	if (listener->wsock)
+	{
+		rb_fde_t *xF[2];
+		if(rb_socketpair(AF_UNIX, SOCK_STREAM, 0, &xF[0], &xF[1], "Incoming wsockd Connection") == -1)
+		{
+			SetIOError(new_client);
+			exit_client(new_client, new_client, new_client, "Fatal Error");
+			return;
+		}
+		new_client->localClient->ws_ctl = start_wsockd_accept(F, xF[1], connid_get(new_client));        /* this will close F for us */
+		if(new_client->localClient->ws_ctl == NULL)
+		{
+			SetIOError(new_client);
+			exit_client(new_client, new_client, new_client, "Service Unavailable");
+			return;
+		}
+		F = xF[0];
+		new_client->localClient->F = F;
+	}
+
 	new_client->localClient->listener = listener;
 
 	++listener->ref_count;
 
-	start_auth(new_client);
+	authd_initiate_client(new_client, defer);
+}
+
+static int
+accept_sslcallback(struct Client *client_p, int status)
+{
+	authd_deferred_client(client_p);
+	return 0; /* use default handler if status != RB_OK */
 }
 
 static const char *toofast = "ERROR :Reconnecting too fast, throttled.\r\n";
@@ -576,8 +592,11 @@ accept_precallback(rb_fde_t *F, struct sockaddr *addr, rb_socklen_t addrlen, voi
 		return 0;
 	}
 
-	if(check_reject(F, addr))
+	if(check_reject(F, addr)) {
+		/* Reject the connection without closing the socket
+		 * because it is now on the delay_exit list. */
 		return 0;
+	}
 
 	if(throttle_add(addr))
 	{

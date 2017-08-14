@@ -102,9 +102,13 @@ void rb_note(rb_fde_t *, const char *);
 #define RB_SSL_CERTFP_LEN	64
 
 /* Methods for certfp */
-#define RB_SSL_CERTFP_METH_SHA1		0
-#define RB_SSL_CERTFP_METH_SHA256	1
-#define RB_SSL_CERTFP_METH_SHA512	2
+/* Digest of full X.509 certificate */
+#define RB_SSL_CERTFP_METH_CERT_SHA1	0x0000
+#define RB_SSL_CERTFP_METH_CERT_SHA256	0x0001
+#define RB_SSL_CERTFP_METH_CERT_SHA512	0x0002
+/* Digest of SubjectPublicKeyInfo (RFC 5280), used by DANE (RFC 6698) */
+#define RB_SSL_CERTFP_METH_SPKI_SHA256	0x1001
+#define RB_SSL_CERTFP_METH_SPKI_SHA512	0x1002
 
 #define RB_SSL_CERTFP_LEN_SHA1		20
 #define RB_SSL_CERTFP_LEN_SHA256	32
@@ -117,8 +121,8 @@ int rb_get_sockerr(rb_fde_t *);
 
 void rb_settimeout(rb_fde_t *, time_t, PF *, void *);
 void rb_checktimeouts(void *);
-void rb_connect_tcp(rb_fde_t *, struct sockaddr *, struct sockaddr *, int, CNCB *, void *, int);
-void rb_connect_tcp_ssl(rb_fde_t *, struct sockaddr *, struct sockaddr *, int, CNCB *, void *, int);
+void rb_connect_tcp(rb_fde_t *, struct sockaddr *, struct sockaddr *, CNCB *, void *, int);
+void rb_connect_tcp_ssl(rb_fde_t *, struct sockaddr *, struct sockaddr *, CNCB *, void *, int);
 int rb_connect_sockaddr(rb_fde_t *, struct sockaddr *addr, int len);
 
 const char *rb_errstr(int status);
@@ -152,6 +156,7 @@ int rb_fd_ssl(rb_fde_t *F);
 rb_platform_fd_t rb_get_fd(rb_fde_t *F);
 const char *rb_get_ssl_strerror(rb_fde_t *F);
 int rb_get_ssl_certfp(rb_fde_t *F, uint8_t certfp[RB_SSL_CERTFP_LEN], int method);
+int rb_get_ssl_certfp_file(const char *filename, uint8_t certfp[RB_SSL_CERTFP_LEN], int method);
 
 rb_fde_t *rb_get_fde(rb_platform_fd_t fd);
 
@@ -181,10 +186,11 @@ int rb_supports_ssl(void);
 unsigned int rb_ssl_handshake_count(rb_fde_t *F);
 void rb_ssl_clear_handshake_count(rb_fde_t *F);
 
-
 int rb_pass_fd_to_process(rb_fde_t *, pid_t, rb_fde_t *);
 rb_fde_t *rb_recv_fd(rb_fde_t *);
 
 const char *rb_ssl_get_cipher(rb_fde_t *F);
+
+int rb_ipv4_from_ipv6(const struct sockaddr_in6 *restrict ip6, struct sockaddr_in *restrict ip4);
 
 #endif /* INCLUDED_commio_h */

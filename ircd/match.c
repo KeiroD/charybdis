@@ -313,7 +313,7 @@ int comp_with_mask(void *addr, void *dest, unsigned int mask)
 	if (memcmp(addr, dest, mask / 8) == 0)
 	{
 		int n = mask / 8;
-		int m = ((-1) << (8 - (mask % 8)));
+		unsigned char m = (0xFF << (8 - (mask % 8)));
 		if (mask % 8 == 0 || (((unsigned char *) addr)[n] & m) == (((unsigned char *) dest)[n] & m))
 		{
 			return (1);
@@ -358,8 +358,8 @@ int match_ips(const char *s1, const char *s2)
 	void *ipptr, *maskptr;
 	int cidrlen, aftype;
 
-	strcpy(mask, s1);
-	strcpy(address, s2);
+	rb_strlcpy(mask, s1, sizeof(mask));
+	rb_strlcpy(address, s2, sizeof(address));
 
 	len = strrchr(mask, '/');
 	if (len == NULL)
@@ -422,8 +422,8 @@ int match_cidr(const char *s1, const char *s2)
 	void *ipptr, *maskptr;
 	int cidrlen, aftype;
 
-	strcpy(mask, s1);
-	strcpy(address, s2);
+	rb_strlcpy(mask, s1, sizeof(mask));
+	rb_strlcpy(address, s2, sizeof(address));
 
 	ipmask = strrchr(mask, '@');
 	if (ipmask == NULL)
@@ -670,7 +670,7 @@ const unsigned char irctoupper_tab[] = {
  * NOTE: RFC 1459 sez: anything but a ^G, comma, or space is allowed
  * for channel names
  */
-const unsigned int CharAttrs[] = {
+unsigned int CharAttrs[] = {
 /* 0  */ CNTRL_C,
 /* 1  */ CNTRL_C | CHAN_C | NONEOS_C,
 /* 2  */ CNTRL_C | CHAN_C | FCHAN_C | NONEOS_C,

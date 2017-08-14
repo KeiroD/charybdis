@@ -41,9 +41,8 @@ struct Blacklist;
 
 /* we store ipv6 ips for remote clients, so this needs to be v6 always */
 #define HOSTIPLEN	53	/* sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255.ipv6") */
-#define PASSWDLEN       128
-#define CIPHERKEYLEN    64	/* 512bit */
-#define CLIENT_BUFSIZE 512	/* must be at least 512 bytes */
+#define PASSWDLEN	128
+#define CIPHERKEYLEN	64	/* 512bit */
 
 #define IDLEN		10
 
@@ -63,10 +62,12 @@ struct Client;
 struct User;
 struct Server;
 struct LocalUser;
-struct AuthRequest;
 struct PreClient;
 struct ListClient;
 struct scache_entry;
+struct ws_ctl;
+
+typedef int SSL_OPEN_CB(struct Client *, int status);
 
 /*
  * Client structures
@@ -115,8 +116,7 @@ struct Client
 
 	time_t tsinfo;		/* TS on the nick, SVINFO on server */
 	unsigned int umodes;	/* opers, normal users subset */
-	unsigned int flags;	/* client flags */
-	unsigned int flags2;	/* ugh. overflow */
+	uint64_t flags;		/* client flags */
 
 	unsigned int snomask;	/* server notice mask */
 
@@ -166,7 +166,9 @@ struct Client
 
 struct LocalUser
 {
-	rb_dlink_node tnode;	/* This is the node for the local list type the client is on*/
+	rb_dlink_node tnode;	/* This is the node for the local list type the client is on */
+	rb_dlink_list connids;	/* This is the list of connids to free */
+
 	/*
 	 * The following fields are allocated only for local clients
 	 * (directly connected to *this* server with a socket.
@@ -188,6 +190,7 @@ struct LocalUser
 	/* Send and receive linebuf queues .. */
 	buf_head_t buf_sendq;
 	buf_head_t buf_recvq;
+
 	/*
 	 * we want to use unsigned int here so the sizes have a better chance of
 	 * staying the same on 64 bit machines. The current trend is to use
@@ -197,13 +200,15 @@ struct LocalUser
 	 * performed on these, it's not safe to allow them to become negative,
 	 * which is possible for long running server connections. Unsigned values
 	 * generally overflow gracefully. --Bleep
+	 *
+	 * We have modern conveniences. Let's use uint32_t. --Elizafox
 	 */
-	unsigned int sendM;	/* Statistics: protocol messages send */
-	unsigned int sendK;	/* Statistics: total k-bytes send */
-	unsigned int receiveM;	/* Statistics: protocol messages received */
-	unsigned int receiveK;	/* Statistics: total k-bytes received */
-	unsigned short sendB;	/* counters to count upto 1-k lots of bytes */
-	unsigned short receiveB;	/* sent and received. */
+	uint32_t sendM;		/* Statistics: protocol messages send */
+	uint32_t sendK;		/* Statistics: total k-bytes send */
+	uint32_t receiveM;	/* Statistics: protocol messages received */
+	uint32_t receiveK;	/* Statistics: total k-bytes received */
+	uint16_t sendB;		/* counters to count upto 1-k lots of bytes */
+	uint16_t receiveB;	/* sent and received. */
 	struct Listener *listener;	/* listener accepted from */
 	struct ConfItem *att_conf;	/* attached conf */
 	struct server_conf *att_sconf;
@@ -233,7 +238,6 @@ struct LocalUser
 
 	time_t next_away;	/* Don't allow next away before... */
 	time_t last;
-	uint32_t connid;
 
 	/* clients allowed to talk through +g */
 	rb_dlink_list allow_list;
@@ -249,8 +253,7 @@ struct LocalUser
 	 */
 	int sent_parsed;	/* how many messages we've parsed in this second */
 	time_t last_knock;	/* time of last knock */
-	unsigned long random_ping;
-	struct AuthRequest *auth_request;
+	uint32_t random_ping;
 
 	/* target change stuff */
 	/* targets we're aware of (fnv32(use_id(target_p))):
@@ -272,7 +275,8 @@ struct LocalUser
 
 	struct _ssl_ctl *ssl_ctl;		/* which ssl daemon we're associate with */
 	struct _ssl_ctl *z_ctl;			/* second ctl for ssl+zlib */
-	uint32_t zconnid;
+	struct ws_ctl *ws_ctl;			/* ctl for wsockd */
+	SSL_OPEN_CB *ssl_callback;		/* ssl connection is now open */
 	uint32_t localflags;
 	struct ZipStats *zipstats;		/* zipstats */
 	uint16_t cork_count;			/* used for corking/uncorking connections */
@@ -283,6 +287,24 @@ struct LocalUser
 	char sasl_agent[IDLEN];
 	unsigned char sasl_out;
 	unsigned char sasl_complete;
+
+	unsigned int sasl_messages;
+	unsigned int sasl_failures;
+	time_t sasl_next_retry;
+};
+
+#define AUTHC_F_DEFERRED 0x01
+#define AUTHC_F_COMPLETE 0x02
+
+struct AuthClient
+{
+	uint32_t cid;	/* authd id */
+	time_t timeout;	/* When to terminate authd query */
+	bool accepted;	/* did authd accept us? */
+	char cause;	/* rejection cause */
+	char *data;	/* reason data */
+	char *reason;	/* reason we were rejected */
+	int flags;
 };
 
 struct PreClient
@@ -291,8 +313,7 @@ struct PreClient
 	char spoofuser[USERLEN + 1];
 	char spoofhost[HOSTLEN + 1];
 
-	rb_dlink_list dnsbl_queries; /* list of struct BlacklistClient * */
-	struct Blacklist *dnsbl_listed; /* first dnsbl where it's listed */
+	struct AuthClient auth;
 
 	struct rb_sockaddr_storage lip; /* address of our side of the connection */
 };
@@ -381,26 +402,35 @@ struct ListClient
 
 /* housekeeping flags */
 
-#define FLAGS_PINGSENT     0x0001	/* Unreplied ping sent */
-#define FLAGS_DEAD	   0x0002	/* Local socket is dead--Exiting soon */
-#define FLAGS_KILLED       0x0004	/* Prevents "QUIT" from being sent for this */
-#define FLAGS_SENTUSER     0x0008	/* Client sent a USER command. */
-#define FLAGS_CLICAP       0x0010	/* In CAP negotiation, wait for CAP END */
-#define FLAGS_CLOSING      0x0020	/* set when closing to suppress errors */
-#define FLAGS_PING_COOKIE  0x0040	/* has sent ping cookie */
-#define FLAGS_GOTID        0x0080	/* successful ident lookup achieved */
-#define FLAGS_FLOODDONE    0x0100	/* flood grace period over / reported */
-#define FLAGS_NORMALEX     0x0400	/* Client exited normally */
-#define FLAGS_MARK	   0x10000	/* marked client */
-#define FLAGS_HIDDEN       0x20000	/* hidden server */
-#define FLAGS_EOB          0x40000	/* EOB */
-#define FLAGS_MYCONNECT	   0x80000	/* MyConnect */
-#define FLAGS_IOERROR      0x100000	/* IO error */
-#define FLAGS_SERVICE	   0x200000	/* network service */
-#define FLAGS_TGCHANGE     0x400000	/* we're allowed to clear something */
-#define FLAGS_DYNSPOOF     0x800000	/* dynamic spoof, only opers see ip */
-#define FLAGS_TGEXCESSIVE  0x1000000	/* whether the client has attemped to change targets excessively fast */
-#define FLAGS_CLICAP_DATA  0x2000000	/* requested CAP LS 302 */
+#define FLAGS_PINGSENT		0x00000001	/* Unreplied ping sent */
+#define FLAGS_DEAD		0x00000002	/* Local socket is dead--Exiting soon */
+#define FLAGS_KILLED		0x00000004	/* Prevents "QUIT" from being sent for this */
+#define FLAGS_SENTUSER		0x00000008	/* Client sent a USER command. */
+#define FLAGS_CLICAP		0x00000010	/* In CAP negotiation, wait for CAP END */
+#define FLAGS_CLOSING		0x00000020	/* set when closing to suppress errors */
+#define FLAGS_PING_COOKIE	0x00000040	/* has sent ping cookie */
+#define FLAGS_GOTID		0x00000080	/* successful ident lookup achieved */
+#define FLAGS_FLOODDONE		0x00000100	/* flood grace period over / reported */
+#define FLAGS_NORMALEX		0x00000200	/* Client exited normally */
+#define FLAGS_MARK		0x00000400	/* marked client */
+#define FLAGS_HIDDEN		0x00000800	/* hidden server */
+#define FLAGS_EOB		0x00001000	/* EOB */
+#define FLAGS_MYCONNECT		0x00002000	/* MyConnect */
+#define FLAGS_IOERROR		0x00004000	/* IO error */
+#define FLAGS_SERVICE		0x00008000	/* network service */
+#define FLAGS_TGCHANGE		0x00010000	/* we're allowed to clear something */
+#define FLAGS_DYNSPOOF		0x00020000	/* dynamic spoof, only opers see ip */
+#define FLAGS_TGEXCESSIVE	0x00040000	/* whether the client has attemped to change targets excessively fast */
+#define FLAGS_CLICAP_DATA	0x00080000	/* requested CAP LS 302 */
+#define FLAGS_EXTENDCHANS	0x00100000
+#define FLAGS_EXEMPTRESV	0x00200000
+#define FLAGS_EXEMPTKLINE	0x00400000
+#define FLAGS_EXEMPTFLOOD	0x00800000
+#define FLAGS_IP_SPOOFING	0x01000000
+#define FLAGS_EXEMPTSPAMBOT	0x02000000
+#define FLAGS_EXEMPTSHIDE	0x04000000
+#define FLAGS_EXEMPTJUPE	0x08000000
+
 
 /* flags for local clients, this needs stuff moved from above to here at some point */
 #define LFLAGS_SSL		0x00000001
@@ -424,17 +454,6 @@ struct ListClient
 #define UMODE_OPER         0x1000	/* Operator */
 #define UMODE_ADMIN        0x2000	/* Admin on server */
 #define UMODE_SSLCLIENT    0x4000	/* using SSL */
-
-/* overflow flags */
-/* EARLIER FLAGS ARE IN s_newconf.h */
-#define FLAGS2_EXTENDCHANS	0x00200000
-#define FLAGS2_EXEMPTRESV	0x00400000
-#define FLAGS2_EXEMPTKLINE      0x00800000
-#define FLAGS2_EXEMPTFLOOD      0x01000000
-#define FLAGS2_IP_SPOOFING      0x10000000
-#define FLAGS2_EXEMPTSPAMBOT	0x20000000
-#define FLAGS2_EXEMPTSHIDE	0x40000000
-#define FLAGS2_EXEMPTJUPE	0x80000000
 
 #define DEFAULT_OPER_UMODES (UMODE_SERVNOTICE | UMODE_OPERWALL | \
                              UMODE_WALLOP | UMODE_LOCOPS)
@@ -517,25 +536,22 @@ struct ListClient
 #define SetGotId(x)             ((x)->flags |= FLAGS_GOTID)
 #define IsGotId(x)              (((x)->flags & FLAGS_GOTID) != 0)
 
-/*
- * flags2 macros.
- */
-#define IsExemptKline(x)        ((x)->flags2 & FLAGS2_EXEMPTKLINE)
-#define SetExemptKline(x)       ((x)->flags2 |= FLAGS2_EXEMPTKLINE)
-#define IsExemptFlood(x)        ((x)->flags2 & FLAGS2_EXEMPTFLOOD)
-#define SetExemptFlood(x)       ((x)->flags2 |= FLAGS2_EXEMPTFLOOD)
-#define IsExemptSpambot(x)	((x)->flags2 & FLAGS2_EXEMPTSPAMBOT)
-#define SetExemptSpambot(x)	((x)->flags2 |= FLAGS2_EXEMPTSPAMBOT)
-#define IsExemptShide(x)	((x)->flags2 & FLAGS2_EXEMPTSHIDE)
-#define SetExemptShide(x)	((x)->flags2 |= FLAGS2_EXEMPTSHIDE)
-#define IsExemptJupe(x)		((x)->flags2 & FLAGS2_EXEMPTJUPE)
-#define SetExemptJupe(x)	((x)->flags2 |= FLAGS2_EXEMPTJUPE)
-#define IsExemptResv(x)		((x)->flags2 & FLAGS2_EXEMPTRESV)
-#define SetExemptResv(x)	((x)->flags2 |= FLAGS2_EXEMPTRESV)
-#define IsIPSpoof(x)            ((x)->flags2 & FLAGS2_IP_SPOOFING)
-#define SetIPSpoof(x)           ((x)->flags2 |= FLAGS2_IP_SPOOFING)
-#define IsExtendChans(x)	((x)->flags2 & FLAGS2_EXTENDCHANS)
-#define SetExtendChans(x)	((x)->flags2 |= FLAGS2_EXTENDCHANS)
+#define IsExemptKline(x)        ((x)->flags & FLAGS_EXEMPTKLINE)
+#define SetExemptKline(x)       ((x)->flags |= FLAGS_EXEMPTKLINE)
+#define IsExemptFlood(x)        ((x)->flags & FLAGS_EXEMPTFLOOD)
+#define SetExemptFlood(x)       ((x)->flags |= FLAGS_EXEMPTFLOOD)
+#define IsExemptSpambot(x)	((x)->flags & FLAGS_EXEMPTSPAMBOT)
+#define SetExemptSpambot(x)	((x)->flags |= FLAGS_EXEMPTSPAMBOT)
+#define IsExemptShide(x)	((x)->flags & FLAGS_EXEMPTSHIDE)
+#define SetExemptShide(x)	((x)->flags |= FLAGS_EXEMPTSHIDE)
+#define IsExemptJupe(x)		((x)->flags & FLAGS_EXEMPTJUPE)
+#define SetExemptJupe(x)	((x)->flags |= FLAGS_EXEMPTJUPE)
+#define IsExemptResv(x)		((x)->flags & FLAGS_EXEMPTRESV)
+#define SetExemptResv(x)	((x)->flags |= FLAGS_EXEMPTRESV)
+#define IsIPSpoof(x)            ((x)->flags & FLAGS_IP_SPOOFING)
+#define SetIPSpoof(x)           ((x)->flags |= FLAGS_IP_SPOOFING)
+#define IsExtendChans(x)	((x)->flags & FLAGS_EXTENDCHANS)
+#define SetExtendChans(x)	((x)->flags |= FLAGS_EXTENDCHANS)
 
 /* for local users: flood grace period is over
  * for servers: mentioned in networknotice.c notice
@@ -568,13 +584,10 @@ extern int is_remote_connect(struct Client *);
 extern void init_client(void);
 extern struct Client *make_client(struct Client *from);
 extern void free_pre_client(struct Client *client);
-extern void free_client(struct Client *client);
 
 extern int exit_client(struct Client *, struct Client *, struct Client *, const char *);
 
 extern void error_exit_client(struct Client *, int);
-
-
 
 extern void count_local_client_memory(size_t * count, size_t * memory);
 extern void count_remote_client_memory(size_t * count, size_t * memory);
@@ -594,7 +607,6 @@ extern int show_ip(struct Client *source_p, struct Client *target_p);
 extern int show_ip_conf(struct ConfItem *aconf, struct Client *source_p);
 extern int show_ip_whowas(struct Whowas *whowas, struct Client *source_p);
 
-extern void initUser(void);
 extern void free_user(struct User *, struct Client *);
 extern struct User *make_user(struct Client *);
 extern struct Server *make_server(struct Client *);
@@ -604,5 +616,9 @@ extern char *generate_uid(void);
 
 void allocate_away(struct Client *);
 void free_away(struct Client *);
+
+uint32_t connid_get(struct Client *client_p);
+void connid_put(uint32_t id);
+void client_release_connids(struct Client *client_p);
 
 #endif /* INCLUDED_client_h */

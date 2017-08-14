@@ -20,6 +20,7 @@
 
 #include "authd.h"
 #include "dns.h"
+#include "notice.h"
 #include "res.h"
 
 static void handle_lookup_ip_reply(void *data, struct DNSReply *reply);
@@ -69,15 +70,18 @@ lookup_ip(const char *host, int aftype, DNSCB callback, void *data)
 
 /* See lookup_ip's comment */
 struct dns_query *
-lookup_hostname(const char *ip, int aftype, DNSCB callback, void *data)
+lookup_hostname(const char *ip, DNSCB callback, void *data)
 {
 	struct dns_query *query = rb_malloc(sizeof(struct dns_query));
+	int aftype;
 
 	if(!rb_inet_pton_sock(ip, (struct sockaddr *)&query->addr))
 	{
 		rb_free(query);
 		return NULL;
 	}
+
+	aftype = GET_SS_FAMILY(&query->addr);
 
 	if(aftype == AF_INET)
 		query->type = QUERY_PTR_A;
@@ -115,16 +119,16 @@ static void
 handle_lookup_ip_reply(void *data, struct DNSReply *reply)
 {
 	struct dns_query *query = data;
-	char ip[64] = "*";
-	query_type type = QUERY_INVALID;
+	char ip[HOSTIPLEN] = "*";
 
-	if(!query)
+	if(query == NULL)
+	{
 		/* Shouldn't happen */
-		exit(2);
+		warn_opers(L_CRIT, "DNS: handle_lookup_ip_reply: query == NULL!");
+		exit(EX_DNS_ERROR);
+	}
 
-	type = query->type;
-
-	if(!reply)
+	if(reply == NULL)
 		goto end;
 
 	switch(query->type)
@@ -147,12 +151,14 @@ handle_lookup_ip_reply(void *data, struct DNSReply *reply)
 		break;
 #endif
 	default:
-		exit(3);
+		warn_opers(L_CRIT, "DNS: handle_lookup_ip_reply: unknown query type %d",
+				query->type);
+		exit(EX_DNS_ERROR);
 	}
 
 end:
 	if(query->callback)
-		query->callback(ip, ip[0] != '*', type, query->data);
+		query->callback(ip, ip[0] != '*', query->type, query->data);
 
 	rb_free(query);
 }
@@ -164,11 +170,14 @@ handle_lookup_hostname_reply(void *data, struct DNSReply *reply)
 	struct dns_query *query = data;
 	char *hostname = NULL;
 
-	if(!query)
+	if(query == NULL)
+	{
 		/* Shouldn't happen */
-		exit(4);
+		warn_opers(L_CRIT, "DNS: handle_lookup_hostname_reply: query == NULL!");
+		exit(EX_DNS_ERROR);
+	}
 
-	if(!reply)
+	if(reply == NULL)
 		goto end;
 
 	if(query->type == QUERY_PTR_A)
@@ -177,7 +186,7 @@ handle_lookup_hostname_reply(void *data, struct DNSReply *reply)
 		ip = (struct sockaddr_in *) &query->addr;
 		ip_fwd = (struct sockaddr_in *) &reply->addr;
 
-		if(ip->sin_addr.s_addr == ip_fwd->sin_addr.s_addr && strlen(reply->h_name) < 63)
+		if(ip->sin_addr.s_addr == ip_fwd->sin_addr.s_addr)
 			hostname = reply->h_name;
 	}
 #ifdef RB_IPV6
@@ -187,13 +196,17 @@ handle_lookup_hostname_reply(void *data, struct DNSReply *reply)
 		ip = (struct sockaddr_in6 *) &query->addr;
 		ip_fwd = (struct sockaddr_in6 *) &reply->addr;
 
-		if(memcmp(&ip->sin6_addr, &ip_fwd->sin6_addr, sizeof(struct in6_addr)) == 0 && strlen(reply->h_name) < 63)
+		if(memcmp(&ip->sin6_addr, &ip_fwd->sin6_addr, sizeof(struct in6_addr)) == 0)
 			hostname = reply->h_name;
 	}
 #endif
 	else
+	{
 		/* Shouldn't happen */
-		exit(5);
+		warn_opers(L_CRIT, "DNS: handle_lookup_hostname_reply: unknown query type %d",
+				query->type);
+		exit(EX_DNS_ERROR);
+	}
 end:
 	if(query->callback)
 		query->callback(hostname, hostname != NULL, query->type, query->data);
@@ -207,9 +220,12 @@ submit_dns_answer(const char *reply, bool status, query_type type, void *data)
 	char *id = data;
 
 	if(!id || type == QUERY_INVALID)
-		exit(6);
+	{
+		warn_opers(L_CRIT, "DNS: submit_dns_answer gave us a bad query");
+		exit(EX_DNS_ERROR);
+	}
 
-	if(!reply || !status)
+	if(reply == NULL || status == false)
 	{
 		rb_helper_write(authd_helper, "E %s E %c *", id, type);
 		rb_free(id);
@@ -221,7 +237,7 @@ submit_dns_answer(const char *reply, bool status, query_type type, void *data)
 }
 
 void
-resolve_dns(int parc, char *parv[])
+handle_resolve_dns(int parc, char *parv[])
 {
 	char *id = rb_strdup(parv[1]);
 	char qtype = *parv[2];
@@ -240,52 +256,55 @@ resolve_dns(int parc, char *parv[])
 		break;
 #ifdef RB_IPV6
 	case 'S':
-		aftype = AF_INET6;
 #endif
 	case 'R':
-		if(!lookup_hostname(record, aftype, submit_dns_answer, id))
+		if(!lookup_hostname(record, submit_dns_answer, id))
 			submit_dns_answer(NULL, false, qtype, NULL);
 		break;
 	default:
-		exit(7);
+		warn_opers(L_CRIT, "DNS: handle_resolve_dns got an unknown query: %c", qtype);
+		exit(EX_DNS_ERROR);
 	}
 }
 
 void
-enumerate_nameservers(const char *rid, const char letter)
+enumerate_nameservers(uint32_t rid, const char letter)
 {
-	char buf[40 * IRCD_MAXNS]; /* Plenty */
-	char *c = buf;
-	int i;
+	char buf[(HOSTIPLEN + 1) * IRCD_MAXNS];
+	size_t s = 0;
 
 	if (!irc_nscount)
 	{
 		/* Shouldn't happen */
-		rb_helper_write(authd_helper, "X %s %c NONAMESERVERS", rid, letter);
-		return;
+		warn_opers(L_CRIT, "DNS: no name servers!");
+		stats_error(rid, letter, "NONAMESERVERS");
+		exit(EX_DNS_ERROR);
 	}
 
-	for(i = 0; i < irc_nscount; i++)
+	for(int i = 0; i < irc_nscount; i++)
 	{
-		char addr[40];
-		int ret;
+		char addr[HOSTIPLEN];
+		size_t addrlen;
 
 		rb_inet_ntop_sock((struct sockaddr *)&irc_nsaddr_list[i], addr, sizeof(addr));
 
 		if (!addr[0])
 		{
 			/* Shouldn't happen */
-			rb_helper_write(authd_helper, "X %s %c INVALIDNAMESERVER", rid, letter);
-			return;
+			warn_opers(L_CRIT, "DNS: bad nameserver!");
+			stats_error(rid, letter, "INVALIDNAMESERVER");
+			exit(EX_DNS_ERROR);
 		}
 
-		ret = snprintf(c, 40, "%s ", addr);
-		c += (size_t)ret;
+		addrlen = strlen(addr) + 1;
+		(void)snprintf(&buf[s], sizeof(buf) - s, "%s ", addr);
+		s += addrlen;
 	}
 
-	*(--c) = '\0';
+	if(s > 0)
+		buf[--s] = '\0';
 
-	rb_helper_write(authd_helper, "Y %s %c %s", rid, letter, buf);
+	stats_result(rid, letter, "%s", buf);
 }
 
 void

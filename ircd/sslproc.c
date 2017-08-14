@@ -33,6 +33,7 @@
 #include "client.h"
 #include "send.h"
 #include "packet.h"
+#include "certfp.h"
 
 #define ZIPSTATS_TIME           60
 
@@ -69,11 +70,9 @@ struct _ssl_ctl
 	char version[256];
 };
 
-static void send_new_ssl_certs_one(ssl_ctl_t * ctl, const char *ssl_cert,
-				   const char *ssl_private_key, const char *ssl_dh_params,
-				   const char *ssl_cipher_list);
-static void send_init_prng(ssl_ctl_t * ctl, prng_seed_t seedtype, const char *path);
-static void send_certfp_method(ssl_ctl_t *ctl, int method);
+static void ssld_update_config_one(ssl_ctl_t *ctl);
+static void send_new_ssl_certs_one(ssl_ctl_t * ctl);
+static void send_certfp_method(ssl_ctl_t *ctl);
 
 
 static rb_dlink_list ssl_daemons;
@@ -172,7 +171,10 @@ restart_ssld(void)
 		}
 	}
 
-	start_ssldaemon(ServerInfo.ssld_count, ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+	ssld_spin_count = 0;
+	last_spin = 0;
+	ssld_wait = 0;
+	start_ssldaemon(ServerInfo.ssld_count);
 }
 
 static void
@@ -208,7 +210,7 @@ ssl_dead(ssl_ctl_t * ctl)
 		ssld_count--;
 		ilog(L_MAIN, "ssld helper died - attempting to restart");
 		sendto_realops_snomask(SNO_GENERAL, L_ALL, "ssld helper died - attempting to restart");
-		start_ssldaemon(1, ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+		start_ssldaemon(1);
 	}
 }
 
@@ -237,12 +239,12 @@ restart_ssld_event(void *unused)
 		int start = ServerInfo.ssld_count - get_ssld_count();
 		ilog(L_MAIN, "Attempting to restart ssld processes");
 		sendto_realops_snomask(SNO_GENERAL, L_ALL, "Attempt to restart ssld processes");
-		start_ssldaemon(start, ServerInfo.ssl_cert, ServerInfo.ssl_private_key, ServerInfo.ssl_dh_params, ServerInfo.ssl_cipher_list);
+		start_ssldaemon(start);
 	}
 }
 
 int
-start_ssldaemon(int count, const char *ssl_cert, const char *ssl_private_key, const char *ssl_dh_params, const char *ssl_cipher_list)
+start_ssldaemon(int count)
 {
 	rb_fde_t *F1, *F2;
 	rb_fde_t *P1, *P2;
@@ -340,15 +342,7 @@ start_ssldaemon(int count, const char *ssl_cert, const char *ssl_private_key, co
 		rb_close(P1);
 		ctl = allocate_ssl_daemon(F1, P2, pid);
 		if(ircd_ssl_ok)
-		{
-			send_init_prng(ctl, RB_PRNG_DEFAULT, NULL);
-			send_certfp_method(ctl, ConfigFileEntry.certfp_method);
-
-			if(ssl_cert != NULL && ssl_private_key != NULL)
-				send_new_ssl_certs_one(ctl, ssl_cert, ssl_private_key,
-						       ssl_dh_params != NULL ? ssl_dh_params : "",
-						       ssl_cipher_list != NULL ? ssl_cipher_list : "");
-		}
+			ssld_update_config_one(ctl);
 		ssl_read_ctl(ctl->F, ctl);
 		ssl_do_pipe(P2, ctl);
 
@@ -361,8 +355,12 @@ ssl_process_zipstats(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 {
 	struct Client *server;
 	struct ZipStats *zips;
-	char *parv[7];
-	(void) rb_string_to_array(ctl_buf->buf, parv, 6);
+	char *parv[6];
+	int parc = rb_string_to_array(ctl_buf->buf, parv, sizeof(parv));
+
+	if (parc < sizeof(parv))
+		return;
+
 	server = find_server(NULL, parv[1]);
 	if(server == NULL || server->localClient == NULL || !IsCapable(server, CAP_ZIP))
 		return;
@@ -388,6 +386,30 @@ ssl_process_zipstats(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 }
 
 static void
+ssl_process_open_fd(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
+{
+	struct Client *client_p;
+	uint32_t fd;
+
+	if(ctl_buf->buflen < 5)
+		return; /* bogus message..drop it.. XXX should warn here */
+
+	fd = buf_to_uint32(&ctl_buf->buf[1]);
+	client_p = find_cli_connid_hash(fd);
+	if(client_p == NULL || client_p->localClient == NULL)
+		return;
+
+	if(client_p->localClient->ssl_callback)
+	{
+		SSL_OPEN_CB *hdl = client_p->localClient->ssl_callback;
+
+		client_p->localClient->ssl_callback = NULL;
+
+		hdl(client_p, RB_OK);
+	}
+}
+
+static void
 ssl_process_dead_fd(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 {
 	struct Client *client_p;
@@ -400,8 +422,29 @@ ssl_process_dead_fd(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 	fd = buf_to_uint32(&ctl_buf->buf[1]);
 	rb_strlcpy(reason, &ctl_buf->buf[5], sizeof(reason));
 	client_p = find_cli_connid_hash(fd);
-	if(client_p == NULL)
+	if(client_p == NULL || client_p->localClient == NULL)
 		return;
+
+	if(IsAnyServer(client_p))
+	{
+		sendto_realops_snomask(SNO_GENERAL, is_remote_connect(client_p) && !IsServer(client_p) ? L_NETWIDE : L_ALL, "ssld error for %s: %s", client_p->name, reason);
+		ilog(L_SERVER, "ssld error for %s: %s", log_client_name(client_p, SHOW_IP), reason);
+	}
+
+	/* if there is still a pending callback, call it now */
+	if(client_p->localClient->ssl_callback)
+	{
+		SSL_OPEN_CB *hdl = client_p->localClient->ssl_callback;
+
+		client_p->localClient->ssl_callback = NULL;
+
+		if (hdl(client_p, RB_ERROR_SSL))
+		{
+			/* the callback has exited the client */
+			return;
+		}
+	}
+
 	if(IsAnyServer(client_p) || IsRegistered(client_p))
 	{
 		/* read any last moment ERROR, QUIT or the like -- jilles */
@@ -409,11 +452,6 @@ ssl_process_dead_fd(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 			read_packet(client_p->localClient->F, client_p);
 		if (IsAnyDead(client_p))
 			return;
-	}
-	if(IsAnyServer(client_p))
-	{
-		sendto_realops_snomask(SNO_GENERAL, is_remote_connect(client_p) && !IsServer(client_p) ? L_NETWIDE : L_ALL, "ssld error for %s: %s", client_p->name, reason);
-		ilog(L_SERVER, "ssld error for %s: %s", log_client_name(client_p, SHOW_IP), reason);
 	}
 	exit_client(client_p, client_p, &me, reason);
 }
@@ -449,23 +487,50 @@ ssl_process_certfp(ssl_ctl_t * ctl, ssl_ctl_buf_t * ctl_buf)
 {
 	struct Client *client_p;
 	uint32_t fd;
+	uint32_t certfp_method;
 	uint32_t len;
 	uint8_t *certfp;
 	char *certfp_string;
+	const char *method_string;
+	int method_len;
 
-	if(ctl_buf->buflen > 5 + RB_SSL_CERTFP_LEN)
+	if(ctl_buf->buflen > 13 + RB_SSL_CERTFP_LEN)
 		return;		/* bogus message..drop it.. XXX should warn here */
 
 	fd = buf_to_uint32(&ctl_buf->buf[1]);
-	len = buf_to_uint32(&ctl_buf->buf[5]);
-	certfp = (uint8_t *)&ctl_buf->buf[9];
+	certfp_method = buf_to_uint32(&ctl_buf->buf[5]);
+	len = buf_to_uint32(&ctl_buf->buf[9]);
+	certfp = (uint8_t *)&ctl_buf->buf[13];
 	client_p = find_cli_connid_hash(fd);
 	if(client_p == NULL)
 		return;
+
+	switch (certfp_method) {
+	case RB_SSL_CERTFP_METH_CERT_SHA1:
+		method_string = CERTFP_PREFIX_CERT_SHA1;
+		break;
+	case RB_SSL_CERTFP_METH_CERT_SHA256:
+		method_string = CERTFP_PREFIX_CERT_SHA256;
+		break;
+	case RB_SSL_CERTFP_METH_CERT_SHA512:
+		method_string = CERTFP_PREFIX_CERT_SHA512;
+		break;
+	case RB_SSL_CERTFP_METH_SPKI_SHA256:
+		method_string = CERTFP_PREFIX_SPKI_SHA256;
+		break;
+	case RB_SSL_CERTFP_METH_SPKI_SHA512:
+		method_string = CERTFP_PREFIX_SPKI_SHA512;
+		break;
+	default:
+		return;
+	}
+	method_len = strlen(method_string);
+
 	rb_free(client_p->certfp);
-	certfp_string = rb_malloc(len * 2 + 1);
+	certfp_string = rb_malloc(method_len + len * 2 + 1);
+	rb_strlcpy(certfp_string, method_string, method_len + len * 2 + 1);
 	for(uint32_t i = 0; i < len; i++)
-		snprintf(certfp_string + 2 * i, 3, "%02x",
+		snprintf(certfp_string + method_len + 2 * i, 3, "%02x",
 				certfp[i]);
 	client_p->certfp = certfp_string;
 }
@@ -489,6 +554,9 @@ ssl_process_cmd_recv(ssl_ctl_t * ctl)
 		{
 		case 'N':
 			ircd_ssl_ok = false;	/* ssld says it can't do ssl/tls */
+			break;
+		case 'O':
+			ssl_process_open_fd(ctl, ctl_buf);
 			break;
 		case 'D':
 			ssl_process_dead_fd(ctl, ctl_buf);
@@ -656,11 +724,24 @@ ssl_cmd_write_queue(ssl_ctl_t * ctl, rb_fde_t ** F, int count, const void *buf, 
 
 
 static void
-send_new_ssl_certs_one(ssl_ctl_t * ctl, const char *ssl_cert, const char *ssl_private_key, const char *ssl_dh_params, const char *ssl_cipher_list)
+send_new_ssl_certs_one(ssl_ctl_t * ctl)
 {
-	size_t len;
+	size_t len = 5;
 
-	len = strlen(ssl_cert) + strlen(ssl_private_key) + strlen(ssl_dh_params) + 5;
+	if(ServerInfo.ssl_cert)
+		len += strlen(ServerInfo.ssl_cert);
+	else
+		return;
+
+	if(ServerInfo.ssl_private_key)
+		len += strlen(ServerInfo.ssl_private_key);
+
+	if(ServerInfo.ssl_dh_params)
+		len += strlen(ServerInfo.ssl_dh_params);
+
+	if(ServerInfo.ssl_cipher_list)
+		len += strlen(ServerInfo.ssl_cipher_list);
+
 	if(len > sizeof(tmpbuf))
 	{
 		sendto_realops_snomask(SNO_GENERAL, L_ALL,
@@ -671,66 +752,49 @@ send_new_ssl_certs_one(ssl_ctl_t * ctl, const char *ssl_cert, const char *ssl_pr
 		     len, sizeof(tmpbuf));
 		return;
 	}
-	len = snprintf(tmpbuf, sizeof(tmpbuf), "K%c%s%c%s%c%s%c%s%c", nul, ssl_cert, nul,
-			  ssl_private_key, nul, ssl_dh_params, nul,
-			  ssl_cipher_list != NULL ? ssl_cipher_list : "", nul);
-	ssl_cmd_write_queue(ctl, NULL, 0, tmpbuf, len);
+
+	int ret = snprintf(tmpbuf, sizeof(tmpbuf), "K%c%s%c%s%c%s%c%s%c", nul,
+	                   ServerInfo.ssl_cert, nul,
+	                   ServerInfo.ssl_private_key != NULL ? ServerInfo.ssl_private_key : "", nul,
+	                   ServerInfo.ssl_dh_params != NULL ? ServerInfo.ssl_dh_params : "", nul,
+	                   ServerInfo.ssl_cipher_list != NULL ? ServerInfo.ssl_cipher_list : "", nul);
+
+	if(ret > 5)
+		ssl_cmd_write_queue(ctl, NULL, 0, tmpbuf, (size_t) ret);
 }
 
 static void
-send_init_prng(ssl_ctl_t * ctl, prng_seed_t seedtype, const char *path)
-{
-	size_t len;
-	const char *s;
-	uint8_t seed = (uint8_t) seedtype;
-
-	if(path == NULL)
-		s = "";
-	else
-		s = path;
-
-	len = strlen(s) + 3;
-	if(len > sizeof(tmpbuf))
-	{
-		sendto_realops_snomask(SNO_GENERAL, L_ALL,
-				       "Parameters for send_init_prng too long (%zd > %zd) to pass to ssld, not sending...",
-				       len, sizeof(tmpbuf));
-		ilog(L_MAIN,
-		     "Parameters for send_init_prng too long (%zd > %zd) to pass to ssld, not sending...",
-		     len, sizeof(tmpbuf));
-		return;
-
-	}
-	len = snprintf(tmpbuf, sizeof(tmpbuf), "I%c%s%c", seed, s, nul);
-	ssl_cmd_write_queue(ctl, NULL, 0, tmpbuf, len);
-}
-
-static void
-send_certfp_method(ssl_ctl_t *ctl, int method)
+send_certfp_method(ssl_ctl_t *ctl)
 {
 	char buf[5];
 
 	buf[0] = 'F';
-	uint32_to_buf(&buf[1], method);
+	uint32_to_buf(&buf[1], ConfigFileEntry.certfp_method);
 	ssl_cmd_write_queue(ctl, NULL, 0, buf, sizeof(buf));
 }
 
+static void
+ssld_update_config_one(ssl_ctl_t *ctl)
+{
+	send_certfp_method(ctl);
+	send_new_ssl_certs_one(ctl);
+}
+
 void
-send_new_ssl_certs(const char *ssl_cert, const char *ssl_private_key, const char *ssl_dh_params, const char *ssl_cipher_list)
+ssld_update_config(void)
 {
 	rb_dlink_node *ptr;
-	if(ssl_cert == NULL || ssl_private_key == NULL || ssl_dh_params == NULL)
-	{
-		ircd_ssl_ok = false;
-		return;
-	}
+
 	RB_DLINK_FOREACH(ptr, ssl_daemons.head)
 	{
 		ssl_ctl_t *ctl = ptr->data;
-		send_new_ssl_certs_one(ctl, ssl_cert, ssl_private_key, ssl_dh_params, ssl_cipher_list);
+
+		if (ctl->dead || ctl->shutdown)
+			continue;
+
+		ssld_update_config_one(ctl);
 	}
 }
-
 
 ssl_ctl_t *
 start_ssld_accept(rb_fde_t * sslF, rb_fde_t * plainF, uint32_t id)
@@ -809,7 +873,6 @@ start_zlib_session(void *data)
 	rb_fde_t *F[2];
 	rb_fde_t *xF1, *xF2;
 	char *buf;
-	char buf2[9];
 	void *recvq_start;
 
 	size_t hdr = (sizeof(uint8_t) * 2) + sizeof(uint32_t);
@@ -863,23 +926,11 @@ start_zlib_session(void *data)
 		return;
 	}
 
-	if(IsSSL(server))
-	{
-		/* tell ssld the new connid for the ssl part*/
-		buf2[0] = 'Y';
-		uint32_to_buf(&buf2[1], rb_get_fd(server->localClient->F));
-		uint32_to_buf(&buf2[5], rb_get_fd(xF2));
-		ssl_cmd_write_queue(server->localClient->ssl_ctl, NULL, 0, buf2, sizeof(buf2));
-	}
-
-
 	F[0] = server->localClient->F;
 	F[1] = xF1;
-	del_from_zconnid_hash(server);
 	server->localClient->F = xF2;
 	/* need to redo as what we did before isn't valid now */
-	uint32_to_buf(&buf[1], server->localClient->zconnid);
-	add_to_zconnid_hash(server);
+	uint32_to_buf(&buf[1], connid_get(server));
 
 	server->localClient->z_ctl = which_ssld();
 	if(!server->localClient->z_ctl)

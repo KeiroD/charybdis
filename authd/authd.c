@@ -20,16 +20,23 @@
 
 #include "authd.h"
 #include "dns.h"
+#include "provider.h"
+#include "notice.h"
 
 #define MAXPARA 10
 
+static void error_cb(rb_helper *helper) __attribute__((noreturn));
 static void handle_reload(int parc, char *parv[]);
 static void handle_stat(int parc, char *parv[]);
+static void handle_options(int parc, char *parv[]);
 
 rb_helper *authd_helper = NULL;
 authd_cmd_handler authd_cmd_handlers[256] = {
-	['H'] = handle_reload,
-	['D'] = resolve_dns,
+	['C'] = handle_new_connection,
+	['D'] = handle_resolve_dns,
+	['E'] = handle_cancel_connection,
+	['O'] = handle_options,
+	['R'] = handle_reload,
 	['S'] = handle_stat,
 };
 
@@ -41,19 +48,56 @@ authd_reload_handler authd_reload_handlers[256] = {
 	['D'] = reload_nameservers,
 };
 
+rb_dictionary *authd_option_handlers;
+
 static void
 handle_stat(int parc, char *parv[])
 {
 	authd_stat_handler handler;
+	unsigned long long rid;
 
 	if(parc < 3)
-		 /* XXX Should log this somehow */
+	{
+		warn_opers(L_CRIT, "BUG: handle_stat received too few parameters (at least 3 expected, got %d)", parc);
 		return;
+	}
+
+	if((rid = strtoull(parv[1], NULL, 16)) > UINT32_MAX)
+	{
+		warn_opers(L_CRIT, "BUG: handle_stat got a rid that was too large: %s", parv[1]);
+		return;
+	}
 
 	if (!(handler = authd_stat_handlers[(unsigned char)parv[2][0]]))
 		return;
 
-	handler(parv[1], parv[2][0]);
+	handler((uint32_t)rid, parv[2][0]);
+}
+
+static void
+handle_options(int parc, char *parv[])
+{
+	struct auth_opts_handler *handler;
+
+	if(parc < 2)
+	{
+		warn_opers(L_CRIT, "BUG: handle_options received too few parameters (at least 2 expected, got %d)", parc);
+		return;
+	}
+
+	if((handler = rb_dictionary_retrieve(authd_option_handlers, parv[1])) == NULL)
+	{
+		warn_opers(L_CRIT, "BUG: handle_options got a bad option type %s", parv[1]);
+		return;
+	}
+
+	if((parc - 2) < handler->min_parc)
+	{
+		warn_opers(L_CRIT, "BUG: handle_options received too few parameters (at least %d expected, got %d)", handler->min_parc, parc);
+		return;
+	}
+
+	handler->handler(parv[1], parc - 2, (const char **)&parv[2]);
 }
 
 static void
@@ -61,9 +105,17 @@ handle_reload(int parc, char *parv[])
 {
 	authd_reload_handler handler;
 
-	if(parc < 2)
-		 /* XXX Should log this somehow */
+	if(parc <= 2)
+	{
+		/* Reload all handlers */
+		for(size_t i = 0; i < 256; i++)
+		{
+			if ((handler = authd_reload_handlers[(unsigned char) i]) != NULL)
+				handler('\0');
+		}
+
 		return;
+	}
 
 	if (!(handler = authd_reload_handlers[(unsigned char)parv[1][0]]))
 		return;
@@ -96,7 +148,7 @@ parse_request(rb_helper *helper)
 static void
 error_cb(rb_helper *helper)
 {
-	exit(1);
+	exit(EX_ERROR);
 }
 
 #ifndef _WIN32
@@ -145,15 +197,24 @@ main(int argc, char *argv[])
 	if(authd_helper == NULL)
 	{
 		fprintf(stderr, "authd is not meant to be invoked by end users\n");
-		exit(1);
+		exit(EX_ERROR);
 	}
 
 	rb_set_time();
 	setup_signals();
+
+	authd_option_handlers = rb_dictionary_create("authd options handlers", rb_strcasecmp);
+
 	init_resolver();
+	init_providers();
 	rb_init_prng(NULL, RB_PRNG_DEFAULT);
 
 	rb_helper_loop(authd_helper, 0);
+
+	/*
+	 * XXX this function will never be called from here -- is it necessary?
+	 */
+	destroy_providers();
 
 	return 0;
 }

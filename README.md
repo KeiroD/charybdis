@@ -50,6 +50,13 @@ Anything else that hasn't been tested. Charybdis may or may not work on it; patc
 
 These are known issues and workarounds for supported platforms.
 
+ * **Mac OS X and macOS **: you must set the LIBTOOLIZE environment
+   variable to point to glibtoolize before running autogen.sh:
+   `$ brew install libtool`
+   `$ LIBTOOLIZE="/opt/local/bin/glibtoolize"`
+   `$ export LIBTOOLIZE`
+   `$ ./autogen.sh`
+
  * **FreeBSD**: if you are compiling with ipv6 you may experience
    problems with ipv4 due to the way the socket code is written.  To
    fix this you must: "sysctl net.inet6.ip6.v6only=0"
@@ -66,21 +73,22 @@ You will need to run `autogen.sh` to build the autotools files prior to building
 
  * For SSL/TLS client and server connections, one of:
 
-   * OpenSSL 1.0 or newer
-   * LibreSSL
-   * mbedTLS
-   * GnuTLS
+   * OpenSSL 1.0.0 or newer (--enable-openssl)
+   * LibreSSL (--enable-openssl)
+   * mbedTLS (--enable-mbedtls)
+   * GnuTLS (--enable-gnutls)
 
- * For certificate-based oper CHALLENGE, OpenSSL 1.0 or newer.
+ * For certificate-based oper CHALLENGE, OpenSSL 1.0.0 or newer.
    (Using CHALLENGE is not recommended for new deployments, so if you want to use a different TLS library,
     feel free.)
 
- * For ECDHE, OpenSSL 1.0.0 or newer is required. Solaris; and RHEL/Fedora and its derivatives such as CentOS
-   have removed support for ECC/ECDHE. You will need to compile your own OpenSSL on these systems.
+ * For ECDHE under OpenSSL, on Solaris and RHEL/Fedora (and its derivatives such as CentOS) you will
+   need to compile your own OpenSSL on these systems, as they have removed support for ECC/ECDHE.
+   Alternatively, consider using another library (see above).
 
 # tips
 
- * To report bugs in charybdis, visit us at irc.freenode.net #charybdis
+ * To report bugs in charybdis, visit us at irc.charybdis.io #charybdis
 
  * Please read doc/index.txt to get an overview of the current documentation.
 
@@ -91,3 +99,10 @@ You will need to run `autogen.sh` to build the autotools files prior to building
    the correct settings.  If these files are wrong, charybdis will try to use
    127.0.0.1 for a resolver as a last-ditch effort.
 
+# git access
+
+ * The Charybdis GIT repository can be checked out using the following command:
+	`git clone https://github.com/charybdis-ircd/charybdis`
+
+ * Charybdis's GIT repository depot can be browsed over the Internet at the following address:
+	https://github.com/charybdis-ircd/charybdis

@@ -10,10 +10,6 @@
 #include <signal.h>
 #include <ctype.h>
 
-#ifdef HAVE_LINUX_TCP_H
-# include <linux/tcp.h>
-#endif
-
 #ifdef __GNUC__
 #undef alloca
 #define alloca __builtin_alloca
@@ -131,28 +127,38 @@ char *rb_strerror(int error);
 #define HOSTIPLEN	53
 #endif
 
+
+/* For those unfamiliar with GNU format attributes, a is the 1 based
+ * argument number of the format string, and b is the 1 based argument
+ * number of the variadic ... */
 #ifdef __GNUC__
-#define slrb_assert(expr)	do								\
-			if(rb_unlikely(!(expr))) {							\
-				rb_lib_log( 						\
-				"file: %s line: %d (%s): Assertion failed: (%s)",	\
-				__FILE__, __LINE__, __PRETTY_FUNCTION__, #expr); 	\
-			}								\
-			while(0)
+#define AFP(a,b) __attribute__((format (printf, a, b)))
 #else
-#define slrb_assert(expr)	do								\
-			if(rb_unlikely(!(expr))) {							\
-				rb_lib_log( 						\
-				"file: %s line: %d: Assertion failed: (%s)",		\
-				__FILE__, __LINE__, #expr); 				\
-			}								\
-			while(0)
+#define AFP(a,b)
 #endif
 
-#ifdef SOFT_ASSERT
-#define lrb_assert(expr) 	slrb_assert(expr)
+
+#ifdef __GNUC__
+#define slrb_assert(expr)	(							\
+			rb_likely((expr)) || (						\
+				rb_lib_log( 						\
+				"file: %s line: %d (%s): Assertion failed: (%s)",	\
+				__FILE__, __LINE__, __PRETTY_FUNCTION__, #expr), 0) 	\
+			)
 #else
-#define lrb_assert(expr)	do { slrb_assert(expr); assert(expr); } while(0)
+#define slrb_assert(expr)	(							\
+			rb_likely((expr)) || (						\
+				rb_lib_log( 						\
+				"file: %s line: %d: Assertion failed: (%s)",		\
+				__FILE__, __LINE__, #expr), 0) 				\
+			)
+#endif
+
+/* evaluates to true if assertion fails */
+#ifdef SOFT_ASSERT
+#define lrb_assert(expr) 	(!slrb_assert(expr))
+#else
+#define lrb_assert(expr)	(assert(slrb_assert(expr)), 0)
 #endif
 
 #ifdef RB_SOCKADDR_HAS_SA_LEN
@@ -163,9 +169,9 @@ char *rb_strerror(int error);
 #define SET_SS_FAMILY(x, y) ((((struct sockaddr *)(x))->sa_family) = y)
 #ifdef RB_SOCKADDR_HAS_SA_LEN
 #define SET_SS_LEN(x, y)	do {							\
-					struct sockaddr *storage;		\
-					storage = ((struct sockaddr *)(x));\
-					storage->sa_len = (y);				\
+					struct sockaddr *_storage;		\
+					_storage = ((struct sockaddr *)(x));\
+					_storage->sa_len = (y);				\
 				} while (0)
 #define GET_SS_LEN(x) (((struct sockaddr *)(x))->sa_len)
 #else /* !RB_SOCKADDR_HAS_SA_LEN */
@@ -175,6 +181,20 @@ char *rb_strerror(int error);
 #else
 #define GET_SS_LEN(x) (((struct sockaddr *)(x))->sa_family == AF_INET ? sizeof(struct sockaddr_in) : 0)
 #endif
+#endif
+
+#ifdef RB_IPV6
+#define GET_SS_PORT(x) (((struct sockaddr *)(x))->sa_family == AF_INET ? ((struct sockaddr_in *)(x))->sin_port : ((struct sockaddr_in6 *)(x))->sin6_port)
+#define SET_SS_PORT(x, y)	do { \
+					if(((struct sockaddr *)(x))->sa_family == AF_INET) { \
+						((struct sockaddr_in *)(x))->sin_port = (y); \
+					} else { \
+						((struct sockaddr_in6 *)(x))->sin6_port = (y); \
+					} \
+				} while (0)
+#else
+#define GET_SS_PORT(x) (((struct sockaddr_in *)(x))->sin_port)
+#define SET_SS_PORT(x, y) (((struct sockaddr_in *)(x))->sin_port = y)
 #endif
 
 #ifndef INADDRSZ
@@ -193,6 +213,10 @@ char *rb_strerror(int error);
 #define UINT16_MAX (65535U)
 #endif
 
+#ifndef UINT32_MAX
+#define UINT32_MAX (4294967295U)
+#endif
+
 
 typedef void log_cb(const char *buffer);
 typedef void restart_cb(const char *buffer);
@@ -201,14 +225,14 @@ typedef void die_cb(const char *buffer);
 char *rb_ctime(const time_t, char *, size_t);
 char *rb_date(const time_t, char *, size_t);
 void rb_lib_log(const char *, ...);
-void rb_lib_restart(const char *, ...);
+void rb_lib_restart(const char *, ...) __attribute__((noreturn));
 void rb_lib_die(const char *, ...);
 void rb_set_time(void);
 const char *rb_lib_version(void);
 
 void rb_lib_init(log_cb * xilog, restart_cb * irestart, die_cb * idie, int closeall, int maxfds,
 		 size_t dh_size, size_t fd_heap_size);
-void rb_lib_loop(long delay);
+void rb_lib_loop(long delay) __attribute__((noreturn));
 
 time_t rb_current_time(void);
 const struct timeval *rb_current_time_tv(void);

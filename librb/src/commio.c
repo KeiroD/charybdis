@@ -110,6 +110,16 @@ free_fds(void)
 	RB_DLINK_FOREACH_SAFE(ptr, next, closed_list.head)
 	{
 		F = ptr->data;
+
+		number_fd--;
+
+#ifdef _WIN32
+		if(F->type & (RB_FD_SOCKET | RB_FD_PIPE))
+			closesocket(F->fd);
+		else
+#endif
+			close(F->fd);
+
 		rb_dlinkDelete(ptr, &closed_list);
 		rb_bh_free(fd_heap, F);
 	}
@@ -336,11 +346,14 @@ rb_accept_tryaccept(rb_fde_t *F, void *data)
 {
 	struct rb_sockaddr_storage st;
 	rb_fde_t *new_F;
-	rb_socklen_t addrlen = sizeof(st);
+	rb_socklen_t addrlen;
 	int new_fd;
 
 	while(1)
 	{
+		memset(&st, 0, sizeof(st));
+		addrlen = sizeof(st);
+
 		new_fd = accept(F->fd, (struct sockaddr *)&st, &addrlen);
 		rb_get_errno();
 		if(new_fd < 0)
@@ -410,10 +423,10 @@ rb_accept_tcp(rb_fde_t *F, ACPRE * precb, ACCB * callback, void *data)
 
 /*
  * void rb_connect_tcp(rb_platform_fd_t fd, struct sockaddr *dest,
- *                       struct sockaddr *clocal, int socklen,
+ *                       struct sockaddr *clocal,
  *                       CNCB *callback, void *data, int timeout)
  * Input: An fd to connect with, a host and port to connect to,
- *        a local sockaddr to connect from + length(or NULL to use the
+ *        a local sockaddr to connect from (or NULL to use the
  *        default), a callback, the data to pass into the callback, the
  *        address family.
  * Output: None.
@@ -423,7 +436,7 @@ rb_accept_tcp(rb_fde_t *F, ACPRE * precb, ACCB * callback, void *data)
  */
 void
 rb_connect_tcp(rb_fde_t *F, struct sockaddr *dest,
-	       struct sockaddr *clocal, int socklen, CNCB * callback, void *data, int timeout)
+	       struct sockaddr *clocal, CNCB * callback, void *data, int timeout)
 {
 	if(F == NULL)
 		return;
@@ -442,7 +455,7 @@ rb_connect_tcp(rb_fde_t *F, struct sockaddr *dest,
 	 * virtual host IP, for completeness.
 	 *   -- adrian
 	 */
-	if((clocal != NULL) && (bind(F->fd, clocal, socklen) < 0))
+	if((clocal != NULL) && (bind(F->fd, clocal, GET_SS_LEN(clocal)) < 0))
 	{
 		/* Failure, call the callback with RB_ERR_BIND */
 		rb_connect_callback(F, RB_ERR_BIND);
@@ -742,9 +755,6 @@ mangle_mapped_sockaddr(struct sockaddr *in)
 {
 	struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)in;
 
-	if(in->sa_family == AF_INET)
-		return;
-
 	if(in->sa_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr))
 	{
 		struct sockaddr_in in4;
@@ -754,7 +764,6 @@ mangle_mapped_sockaddr(struct sockaddr *in)
 		in4.sin_addr.s_addr = ((uint32_t *)&in6->sin6_addr)[3];
 		memcpy(in, &in4, sizeof(struct sockaddr_in));
 	}
-	return;
 }
 #endif
 
@@ -886,17 +895,8 @@ rb_close(rb_fde_t *F)
 		ClearFDOpen(F);
 	}
 
-	number_fd--;
-
-#ifdef _WIN32
-	if(type & (RB_FD_SOCKET | RB_FD_PIPE))
-	{
-		closesocket(fd);
-		return;
-	}
-	else
-#endif
-		close(fd);
+	if(type & RB_FD_LISTEN)
+		shutdown(fd, SHUT_RDWR);
 }
 
 
@@ -1321,16 +1321,16 @@ rb_inet_pton_sock(const char *src, struct sockaddr *dst)
 {
 	if(rb_inet_pton(AF_INET, src, &((struct sockaddr_in *)dst)->sin_addr))
 	{
-		((struct sockaddr_in *)dst)->sin_port = 0;
-		((struct sockaddr_in *)dst)->sin_family = AF_INET;
+		SET_SS_FAMILY(dst, AF_INET);
+		SET_SS_PORT(dst, 0);
 		SET_SS_LEN(dst, sizeof(struct sockaddr_in));
 		return 1;
 	}
 #ifdef RB_IPV6
 	else if(rb_inet_pton(AF_INET6, src, &((struct sockaddr_in6 *)dst)->sin6_addr))
 	{
-		((struct sockaddr_in6 *)dst)->sin6_port = 0;
-		((struct sockaddr_in6 *)dst)->sin6_family = AF_INET6;
+		SET_SS_FAMILY(dst, AF_INET6);
+		SET_SS_PORT(dst, 0);
 		SET_SS_LEN(dst, sizeof(struct sockaddr_in6));
 		return 1;
 	}
@@ -1345,16 +1345,13 @@ rb_inet_ntop_sock(struct sockaddr *src, char *dst, unsigned int size)
 	{
 	case AF_INET:
 		return (rb_inet_ntop(AF_INET, &((struct sockaddr_in *)src)->sin_addr, dst, size));
-		break;
 #ifdef RB_IPV6
 	case AF_INET6:
 		return (rb_inet_ntop
 			(AF_INET6, &((struct sockaddr_in6 *)src)->sin6_addr, dst, size));
-		break;
 #endif
 	default:
 		return NULL;
-		break;
 	}
 }
 
@@ -2096,7 +2093,6 @@ rb_setup_fd(rb_fde_t *F)
 }
 
 
-
 int
 rb_ignore_errno(int error)
 {
@@ -2243,7 +2239,7 @@ rb_send_fd_buf(rb_fde_t *xF, rb_fde_t **F, int count, void *data, size_t datasiz
 	}
 	return sendmsg(rb_get_fd(xF), &msg, MSG_NOSIGNAL);
 }
-#else
+#else /* defined(HAVE_SENDMSG) && !defined(WIN32) */
 #ifndef _WIN32
 int
 rb_recv_fd_buf(rb_fde_t *F, void *data, size_t datasize, rb_fde_t **xF, int nfds)
@@ -2258,5 +2254,38 @@ rb_send_fd_buf(rb_fde_t *xF, rb_fde_t **F, int count, void *data, size_t datasiz
 	errno = ENOSYS;
 	return -1;
 }
-#endif
-#endif
+#endif /* _WIN32 */
+#endif /* defined(HAVE_SENDMSG) && !defined(WIN32) */
+
+#ifdef RB_IPV6
+int
+rb_ipv4_from_ipv6(const struct sockaddr_in6 *restrict ip6, struct sockaddr_in *restrict ip4)
+{
+	int i;
+
+	if (!memcmp(ip6->sin6_addr.s6_addr, "\x20\x02", 2))
+	{
+		/* 6to4 and similar */
+		memcpy(&ip4->sin_addr, ip6->sin6_addr.s6_addr + 2, 4);
+	}
+	else if (!memcmp(ip6->sin6_addr.s6_addr, "\x20\x01\x00\x00", 4))
+	{
+		/* Teredo */
+		for (i = 0; i < 4; i++)
+			((uint8_t *)&ip4->sin_addr)[i] = 0xFF ^
+				ip6->sin6_addr.s6_addr[12 + i];
+	}
+	else
+		return 0;
+	SET_SS_LEN(ip4, sizeof(struct sockaddr_in));
+	ip4->sin_family = AF_INET;
+	ip4->sin_port = 0;
+	return 1;
+}
+#else
+int
+rb_ipv4_from_ipv6(const struct sockaddr_in6 *restrict ip6, struct sockaddr_in *restrict ip4)
+{
+	return 0;
+}
+#endif /* RB_IPV6 */

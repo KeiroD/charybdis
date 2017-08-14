@@ -8,6 +8,7 @@
  */
 
 /* Extensions */
+#loadmodule "extensions/chm_nonotice";
 #loadmodule "extensions/chm_operonly_compat";
 #loadmodule "extensions/chm_quietunreg_compat";
 #loadmodule "extensions/chm_sslonly_compat";
@@ -23,10 +24,12 @@
 #loadmodule "extensions/extb_realname";
 #loadmodule "extensions/extb_server";
 #loadmodule "extensions/extb_ssl";
+#loadmodule "extensions/extb_usermode";
 #loadmodule "extensions/hurt";
 #loadmodule "extensions/m_extendchans";
 #loadmodule "extensions/m_findforwards";
 #loadmodule "extensions/m_identify";
+#loadmodule "extensions/m_locops";
 #loadmodule "extensions/no_oper_invis";
 #loadmodule "extensions/sno_farconnect";
 #loadmodule "extensions/sno_globalkline";
@@ -58,19 +61,21 @@ serverinfo {
 	#vhost = "192.0.2.6";
 	/* for IPv6 */
 	#vhost6 = "2001:db8:2::6";
-	
-	/* ssl_private_key: our ssl private key */
-	ssl_private_key = "etc/ssl.key";
 
-	/* ssl_cert: certificate for our ssl server */
+	/* ssl_cert: certificate (and optionally key) for our ssl server */
 	ssl_cert = "etc/ssl.pem";
+
+	/* ssl_private_key: our ssl private key (if not contained in ssl_cert file) */
+	#ssl_private_key = "etc/ssl.key";
 
 	/* ssl_dh_params: DH parameters, generate with openssl dhparam -out dh.pem 2048
 	 * In general, the DH parameters size should be the same as your key's size.
 	 * However it has been reported that some clients have broken TLS implementations which may
 	 * choke on keysizes larger than 2048-bit, so we would recommend using 2048-bit DH parameters
 	 * for now if your keys are larger than 2048-bit.
-	 */
+	 *
+	 * If you do not provide parameters, some TLS backends will fail on DHE- ciphers,
+	 * and some will succeed but use weak, common DH groups! */
 	ssl_dh_params = "etc/dh.pem";
 
 	/* ssld_count: number of ssld processes you want to start, if you
@@ -159,7 +164,13 @@ listen {
 	/* Listen on IPv6 (if you used host= above). */
 	#host = "2001:db8:2::6";
 	#port = 5000, 6665 .. 6669;
-	#sslport = 9999;
+	#sslport = 6697;
+
+	/* wsock: listeners defined with this option enabled will be websocket listeners,
+	 * and will not accept normal clients.
+	 */
+	wsock = yes;
+	sslport = 9999;
 };
 
 /* auth {}: allow users to connect to the ircd (OLD I:)
@@ -182,7 +193,7 @@ auth {
 	 * flags = ...; below if it is.
 	 */
 	password = "letmein";
-	
+
 	/* spoof: fake the users user@host to be be this.  You may either
 	 * specify a host or a user@host to spoof to.  This is free-form,
 	 * just do everyone a favour and dont abuse it. (OLD I: = flag)
@@ -190,26 +201,28 @@ auth {
 	spoof = "I.still.hate.packets";
 
 	/* Possible flags in auth:
-	 * 
+	 *
 	 * encrypted                  | password is encrypted with mkpasswd
 	 * spoof_notice               | give a notice when spoofing hosts
 	 * exceed_limit (old > flag)  | allow user to exceed class user limits
-	 * kline_exempt (old ^ flag)  | exempt this user from k/g/xlines&dnsbls
-	 * dnsbl_exempt		      | exempt this user from dnsbls
-	 * spambot_exempt	      | exempt this user from spambot checks
-	 * shide_exempt		      | exempt this user from serverhiding
+	 * kline_exempt (old ^ flag)  | exempt this user from k/g/xlines,
+	 *                            | dnsbls, and proxies
+	 * proxy_exempt               | exempt this user from proxies
+	 * dnsbl_exempt               | exempt this user from dnsbls
+	 * spambot_exempt             | exempt this user from spambot checks
+	 * shide_exempt               | exempt this user from serverhiding
 	 * jupe_exempt                | exempt this user from generating
 	 *                              warnings joining juped channels
-	 * resv_exempt		      | exempt this user from resvs
+	 * resv_exempt                | exempt this user from resvs
 	 * flood_exempt               | exempt this user from flood limits
-	 *                                     USE WITH CAUTION.
+	 *                              USE WITH CAUTION.
 	 * no_tilde     (old - flag)  | don't prefix ~ to username if no ident
 	 * need_ident   (old + flag)  | require ident for user in this class
 	 * need_ssl                   | require SSL/TLS for user in this class
 	 * need_sasl                  | require SASL id for user in this class
 	 */
 	flags = kline_exempt, exceed_limit;
-	
+
 	/* class: the class the user is placed in */
 	class = "opers";
 };
@@ -252,13 +265,13 @@ operator "god" {
 	user = "*god@127.0.0.1";
 
 	/* password: the password required to oper.  Unless ~encrypted is
-	 * contained in flags = ...; this will need to be encrypted using 
+	 * contained in flags = ...; this will need to be encrypted using
 	 * mkpasswd, MD5 is supported
 	 */
 	password = "etcnjl8juSU1E";
 
 	/* rsa key: the public key for this oper when using Challenge.
-	 * A password should not be defined when this is used, see 
+	 * A password should not be defined when this is used, see
 	 * doc/challenge.txt for more information.
 	 */
 	#rsa_public_key_file = "/usr/local/ircd/etc/oper.pub";
@@ -306,10 +319,6 @@ connect "irc.uplink.com" {
 	flags = compressed, topicburst;
 
 	#fingerprint = "c77106576abf7f9f90cca0f63874a60f2e40a64b";
-
-	/* If the connection is IPv6, uncomment below.
-	 * Use 0::1, not ::1, for IPv6 localhost. */
-	#aftype = ipv6;
 };
 
 connect "ssl.uplink.com" {
@@ -378,8 +387,7 @@ serverhide {
  * You can have multiple combinations of host and rejection reasons.
  * They are used in pairs of one host/rejection reason.
  *
- * These settings should be adequate for most networks, and are (presently)
- * required for use on StaticBox.
+ * These settings should be adequate for most networks.
  *
  * Word to the wise: Do not use blacklists like SPEWS for blocking IRC
  * connections.
@@ -399,10 +407,10 @@ serverhide {
  * as of this writing.
  *
  * As of charybdis 3.5, a matches parameter is allowed; if omitted, any result
- * is considered a match. If included, a comma-separated list of *quoted* 
+ * is considered a match. If included, a comma-separated list of *quoted*
  * strings is allowed to match queries. They may be of the format "0" to "255"
  * to match the final octet (e.g. 127.0.0.1) or "127.x.y.z" to explicitly match
- * an A record. The blacklist is only applied if it matches anything in the 
+ * an A record. The blacklist is only applied if it matches anything in the
  * list. You may freely mix full IP's and final octets.
  *
  * Consult your blacklist provider for the meaning of these parameters; they
@@ -419,6 +427,78 @@ blacklist {
 #	matches = "4", "6", "127.0.0.10";
 #	reject_reason = "${nick}, your IP (${ip}) is listed in ${dnsbl-host} for some reason. In order to protect ${network-name} from abuse, we are not allowing connections listed in ${dnsbl-host} to connect";
 };
+
+/* These are the OPM settings.
+ * This is similar to the functionality provided by BOPM. It will scan incoming
+ * connections for open proxies by connecting to clients and attempting several
+ * different open proxy handshakes. If they connect back to us (via a dedicated
+ * listening port), and send back the data we send them, they are considered
+ * an open proxy. For politeness reasons (users may be confused by the incoming
+ * connection attempts if they are logging incoming connections), the user is
+ * notified upon connect if they are being scanned.
+ *
+ * WARNING:
+ * These settings are considered experimental. Only the most common proxy types
+ * are checked for (Charybdis is immune from POST and GET proxies). If you are
+ * not comfortable with experimental code, do not use this feature.
+ */
+#opm {
+	/* IPv4 address to listen on. This must be a publicly facing IP address
+	 * to be effective.
+	 * If omitted, it defaults to serverinfo::vhost.
+	 */
+	#listen_ipv4 = "127.0.0.1";
+
+	/* IPv4 port to listen on.
+	 * This should not be the same as any existing listeners.
+	 */
+	#port_ipv4 = 32000;
+
+	/* IPv6 address to listen on. This must be a publicly facing IP address
+	 * to be effective.
+	 * If omitted, it defaults to serverinfo::vhost6.
+	 */
+	#listen_ipv6 = "::1";
+
+	/* IPv6 port to listen on.
+	 * This should not be the same as any existing listeners.
+	 */
+	#port_ipv6 = 32000;
+
+	/* You can also set the listen_port directive which will set both the
+	 * IPv4 and IPv6 ports at once.
+	 */
+	#listen_port = 32000;
+
+	/* This sets the timeout in seconds before ending open proxy scans.
+	 * Values less than 1 or greater than 60 are ignored.
+	 * It is advisable to keep it as short as feasible, so clients do not
+	 * get held up by excessively long scan times.
+	 */
+	#timeout = 5;
+
+	/* These are the ports to scan for SOCKS4 proxies on. They may overlap
+	 * with other scan types. Sensible defaults are given below.
+	 */
+	#socks4_ports = 1080, 10800, 443, 80, 8080, 8000;
+
+	/* These are the ports to scan for SOCKS5 proxies on. They may overlap
+	 * with other scan types. Sensible defaults are given below.
+	 */
+	#socks5_ports = 1080, 10800, 443, 80, 8080, 8000;
+
+	/* These are the ports to scan for HTTP connect proxies on (plaintext).
+	 * They may overlap with other scan types. Sensible defaults are given
+	 * below.
+	 */
+	#httpconnect_ports = 80, 8080, 8000;
+
+	/* These are the ports to scan for HTTPS CONNECT proxies on (SSL).
+	 * They may overlap with other scan types. Sensible defaults are given
+	 * below.
+	 */
+	#httpsconnect_ports = 443, 4443;
+#};
 
 alias "NickServ" {
 	target = "NickServ";
@@ -483,7 +563,7 @@ general {
 	tkline_expire_notices = no;
 	default_floodcount = 10;
 	failed_oper_notice = yes;
-	dots_in_ident=2;
+	dots_in_ident = 2;
 	min_nonwildcard = 4;
 	min_nonwildcard_simple = 3;
 	max_accept = 100;
@@ -508,13 +588,13 @@ general {
 	warn_no_nline = yes;
 	use_propagated_bans = yes;
 	stats_e_disabled = no;
-	stats_c_oper_only=no;
-	stats_h_oper_only=no;
-	stats_y_oper_only=no;
-	stats_o_oper_only=yes;
-	stats_P_oper_only=no;
-	stats_i_oper_only=masked;
-	stats_k_oper_only=masked;
+	stats_c_oper_only = no;
+	stats_h_oper_only = no;
+	stats_y_oper_only = no;
+	stats_o_oper_only = yes;
+	stats_P_oper_only = no;
+	stats_i_oper_only = masked;
+	stats_k_oper_only = masked;
 	map_oper_only = no;
 	operspy_admin_only = no;
 	operspy_dont_care_user_info = no;
@@ -542,7 +622,7 @@ general {
 	throttle_count = 4;
 	max_ratelimit_tokens = 30;
 	away_interval = 30;
-	certfp_method = sha1;
+	certfp_method = spki_sha256;
 	hide_opers_in_whois = no;
 };
 

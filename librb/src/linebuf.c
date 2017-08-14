@@ -31,10 +31,6 @@ static rb_bh *rb_linebuf_heap;
 
 static int bufline_count = 0;
 
-#ifndef LINEBUF_HEAP_SIZE
-#define LINEBUF_HEAP_SIZE 2048
-#endif
-
 /*
  * rb_linebuf_init
  *
@@ -72,18 +68,14 @@ static buf_line_t *
 rb_linebuf_new_line(buf_head_t * bufhead)
 {
 	buf_line_t *bufline;
-	rb_dlink_node *node;
 
 	bufline = rb_linebuf_allocate();
 	if(bufline == NULL)
 		return NULL;
 	++bufline_count;
 
-
-	node = rb_make_rb_dlink_node();
-
 	/* Stick it at the end of the buf list */
-	rb_dlinkAddTail(bufline, node, &bufhead->list);
+	rb_dlinkAddTailAlloc(bufline, &bufhead->list);
 	bufline->refcount++;
 
 	/* And finally, update the allocated size */
@@ -212,7 +204,7 @@ rb_linebuf_copy_line(buf_head_t * bufhead, buf_line_t * bufline, char *data, int
 	/* If its full or terminated, ignore it */
 
 	bufline->raw = 0;
-	lrb_assert(bufline->len < BUF_DATA_SIZE);
+	lrb_assert(bufline->len <= LINEBUF_SIZE);
 	if(bufline->terminated == 1)
 		return 0;
 
@@ -221,12 +213,12 @@ rb_linebuf_copy_line(buf_head_t * bufhead, buf_line_t * bufline, char *data, int
 		return -1;
 
 	/* This is the ~overflow case..This doesn't happen often.. */
-	if(cpylen > (BUF_DATA_SIZE - bufline->len - 1))
+	if(cpylen > (LINEBUF_SIZE - bufline->len))
 	{
-		cpylen = BUF_DATA_SIZE - bufline->len - 1;
+		cpylen = LINEBUF_SIZE - bufline->len;
 		memcpy(bufch, ch, cpylen);
-		bufline->buf[BUF_DATA_SIZE - 1] = '\0';
-		bufch = bufline->buf + BUF_DATA_SIZE - 2;
+		bufline->buf[LINEBUF_SIZE] = '\0';
+		bufch = bufline->buf + LINEBUF_SIZE - 1;
 		while(cpylen && (*bufch == '\r' || *bufch == '\n'))
 		{
 			*bufch = '\0';
@@ -234,8 +226,8 @@ rb_linebuf_copy_line(buf_head_t * bufhead, buf_line_t * bufline, char *data, int
 			bufch--;
 		}
 		bufline->terminated = 1;
-		bufline->len = BUF_DATA_SIZE - 1;
-		bufhead->len += BUF_DATA_SIZE - 1;
+		bufline->len = LINEBUF_SIZE;
+		bufhead->len += LINEBUF_SIZE;
 		return clen;
 	}
 
@@ -286,7 +278,7 @@ rb_linebuf_copy_raw(buf_head_t * bufhead, buf_line_t * bufline, char *data, int 
 	/* If its full or terminated, ignore it */
 
 	bufline->raw = 1;
-	lrb_assert(bufline->len < BUF_DATA_SIZE);
+	lrb_assert(bufline->len <= LINEBUF_SIZE);
 	if(bufline->terminated == 1)
 		return 0;
 
@@ -295,15 +287,14 @@ rb_linebuf_copy_raw(buf_head_t * bufhead, buf_line_t * bufline, char *data, int 
 		return -1;
 
 	/* This is the overflow case..This doesn't happen often.. */
-	if(cpylen > (BUF_DATA_SIZE - bufline->len - 1))
+	if(cpylen > (LINEBUF_SIZE - bufline->len))
 	{
-		clen = BUF_DATA_SIZE - bufline->len - 1;
+		clen = LINEBUF_SIZE - bufline->len;
 		memcpy(bufch, ch, clen);
-		bufline->buf[BUF_DATA_SIZE - 1] = '\0';
-		bufch = bufline->buf + BUF_DATA_SIZE - 2;
+		bufline->buf[LINEBUF_SIZE] = '\0';
 		bufline->terminated = 1;
-		bufline->len = BUF_DATA_SIZE - 1;
-		bufhead->len += BUF_DATA_SIZE - 1;
+		bufline->len = LINEBUF_SIZE;
+		bufhead->len += LINEBUF_SIZE;
 		return clen;
 	}
 
@@ -494,257 +485,43 @@ rb_linebuf_attach(buf_head_t * bufhead, buf_head_t * new)
 }
 
 /*
- * rb_linebuf_putmsg
+ * rb_linebuf_put
  *
- * Similar to rb_linebuf_put, but designed for use by send.c.
- *
- * prefixfmt is used as a format for the varargs, and is inserted first.
- * Then format/va_args is appended to the buffer.
+ * linked list of strings are appended in order.
  */
 void
-rb_linebuf_putmsg(buf_head_t * bufhead, const char *format, va_list * va_args,
-		  const char *prefixfmt, ...)
+rb_linebuf_put(buf_head_t *bufhead, const rb_strf_t *strings)
 {
 	buf_line_t *bufline;
-	int len = 0;
-	va_list prefix_args;
+	size_t len = 0;
+	int ret;
 
 	/* make sure the previous line is terminated */
-#ifndef NDEBUG
-	if(bufhead->list.tail)
-	{
+	if (bufhead->list.tail) {
 		bufline = bufhead->list.tail->data;
 		lrb_assert(bufline->terminated);
 	}
-#endif
-	/* Create a new line */
+
+	/* create a new line */
 	bufline = rb_linebuf_new_line(bufhead);
 
-	if(prefixfmt != NULL)
-	{
-		va_start(prefix_args, prefixfmt);
-		len = vsnprintf(bufline->buf, BUF_DATA_SIZE, prefixfmt, prefix_args);
-		va_end(prefix_args);
-	}
+	ret = rb_fsnprint(bufline->buf, LINEBUF_SIZE + 1, strings);
+	if (ret > 0)
+		len += ret;
 
-	if(va_args != NULL)
-	{
-		len += vsnprintf((bufline->buf + len), (BUF_DATA_SIZE - len), format, *va_args);
-	}
+	if (len > LINEBUF_SIZE)
+		len = LINEBUF_SIZE;
+
+	/* add trailing CRLF */
+	bufline->buf[len++] = '\r';
+	bufline->buf[len++] = '\n';
+	bufline->buf[len] = '\0';
 
 	bufline->terminated = 1;
-
-	/* Truncate the data if required */
-	if(rb_unlikely(len > 510))
-	{
-		len = 510;
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-	}
-	else if(rb_unlikely(len == 0))
-	{
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-		bufline->buf[len] = '\0';
-	}
-	else
-	{
-		/* Chop trailing CRLF's .. */
-		while((bufline->buf[len] == '\r') || (bufline->buf[len] == '\n')
-		      || (bufline->buf[len] == '\0'))
-		{
-			len--;
-		}
-
-		bufline->buf[++len] = '\r';
-		bufline->buf[++len] = '\n';
-		bufline->buf[++len] = '\0';
-	}
 
 	bufline->len = len;
 	bufhead->len += len;
 }
-
-/*
- * rb_linebuf_putprefix
- *
- * Similar to rb_linebuf_put, but designed for use by send.c.
- *
- * prefix is inserted first, then format/va_args is appended to the buffer.
- */
-void
-rb_linebuf_putprefix(buf_head_t * bufhead, const char *format, va_list * va_args,
-		  const char *prefix)
-{
-	buf_line_t *bufline;
-	int len = 0;
-
-	/* make sure the previous line is terminated */
-#ifndef NDEBUG
-	if(bufhead->list.tail)
-	{
-		bufline = bufhead->list.tail->data;
-		lrb_assert(bufline->terminated);
-	}
-#endif
-	/* Create a new line */
-	bufline = rb_linebuf_new_line(bufhead);
-
-	if(prefix != NULL)
-		len = rb_strlcpy(bufline->buf, prefix, BUF_DATA_SIZE);
-
-	if(va_args != NULL)
-	{
-		len += vsnprintf((bufline->buf + len), (BUF_DATA_SIZE - len), format, *va_args);
-	}
-
-	bufline->terminated = 1;
-
-	/* Truncate the data if required */
-	if(rb_unlikely(len > 510))
-	{
-		len = 510;
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-	}
-	else if(rb_unlikely(len == 0))
-	{
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-		bufline->buf[len] = '\0';
-	}
-	else
-	{
-		/* Chop trailing CRLF's .. */
-		while((bufline->buf[len] == '\r') || (bufline->buf[len] == '\n')
-		      || (bufline->buf[len] == '\0'))
-		{
-			len--;
-		}
-
-		bufline->buf[++len] = '\r';
-		bufline->buf[++len] = '\n';
-		bufline->buf[++len] = '\0';
-	}
-
-	bufline->len = len;
-	bufhead->len += len;
-}
-
-void
-rb_linebuf_putbuf(buf_head_t * bufhead, const char *buffer)
-{
-	buf_line_t *bufline;
-	int len = 0;
-
-	/* make sure the previous line is terminated */
-#ifndef NDEBUG
-	if(bufhead->list.tail)
-	{
-		bufline = bufhead->list.tail->data;
-		lrb_assert(bufline->terminated);
-	}
-#endif
-	/* Create a new line */
-	bufline = rb_linebuf_new_line(bufhead);
-
-	if(rb_unlikely(buffer != NULL))
-		len = rb_strlcpy(bufline->buf, buffer, BUF_DATA_SIZE);
-
-	bufline->terminated = 1;
-
-	/* Truncate the data if required */
-	if(rb_unlikely(len > 510))
-	{
-		len = 510;
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-	}
-	else if(rb_unlikely(len == 0))
-	{
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-		bufline->buf[len] = '\0';
-	}
-	else
-	{
-		/* Chop trailing CRLF's .. */
-		while((bufline->buf[len] == '\r') || (bufline->buf[len] == '\n')
-		      || (bufline->buf[len] == '\0'))
-		{
-			len--;
-		}
-
-		bufline->buf[++len] = '\r';
-		bufline->buf[++len] = '\n';
-		bufline->buf[++len] = '\0';
-	}
-
-	bufline->len = len;
-	bufhead->len += len;
-
-
-}
-
-void
-rb_linebuf_put(buf_head_t * bufhead, const char *format, ...)
-{
-	buf_line_t *bufline;
-	int len = 0;
-	va_list args;
-
-	/* make sure the previous line is terminated */
-#ifndef NDEBUG
-	if(bufhead->list.tail)
-	{
-		bufline = bufhead->list.tail->data;
-		lrb_assert(bufline->terminated);
-	}
-#endif
-	/* Create a new line */
-	bufline = rb_linebuf_new_line(bufhead);
-
-	if(rb_unlikely(format != NULL))
-	{
-		va_start(args, format);
-		len = vsnprintf(bufline->buf, BUF_DATA_SIZE, format, args);
-		va_end(args);
-	}
-
-	bufline->terminated = 1;
-
-	/* Truncate the data if required */
-	if(rb_unlikely(len > 510))
-	{
-		len = 510;
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-	}
-	else if(rb_unlikely(len == 0))
-	{
-		bufline->buf[len++] = '\r';
-		bufline->buf[len++] = '\n';
-		bufline->buf[len] = '\0';
-	}
-	else
-	{
-		/* Chop trailing CRLF's .. */
-		while((bufline->buf[len] == '\r') || (bufline->buf[len] == '\n')
-		      || (bufline->buf[len] == '\0'))
-		{
-			len--;
-		}
-
-		bufline->buf[++len] = '\r';
-		bufline->buf[++len] = '\n';
-		bufline->buf[++len] = '\0';
-	}
-
-	bufline->len = len;
-	bufhead->len += len;
-}
-
-
 
 /*
  * rb_linebuf_flush

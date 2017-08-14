@@ -4,7 +4,7 @@ dnl said functions need to be just about as complex as they already are.
 
 AC_PREREQ(2.60)
 
-AC_INIT([charybdis], [3.6.0-dev])
+AC_INIT([charybdis], [4.1-dev])
 
 AC_LANG(C)
 AC_USE_SYSTEM_EXTENSIONS
@@ -656,9 +656,11 @@ AC_CONFIG_FILES(			\
 	authd/Makefile			\
 	bandb/Makefile			\
 	ssld/Makefile			\
+	wsockd/Makefile			\
 	extensions/Makefile		\
 	ircd/Makefile			\
 	modules/Makefile		\
+	tests/Makefile			\
 	tools/Makefile			\
 	tools/genssl			\
 	doc/Makefile			\

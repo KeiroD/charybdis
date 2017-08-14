@@ -53,15 +53,11 @@
 #include "capability.h"
 #include "s_assert.h"
 
-#ifndef INADDR_NONE
-#define INADDR_NONE ((unsigned int) 0xffffffff)
-#endif
-
 int MaxConnectionCount = 1;
 int MaxClientCount = 1;
 int refresh_user_links = 0;
 
-static char buf[BUFSIZE];
+static char buf[EXT_BUFSIZE];
 
 /*
  * list of recognized server capabilities.  "TS" is not on the list
@@ -151,6 +147,7 @@ init_builtin_capabs(void)
 
 static CNCB serv_connect_callback;
 static CNCB serv_connect_ssl_callback;
+static SSL_OPEN_CB serv_connect_ssl_open_callback;
 
 /*
  * hunt_server - Do the basic thing in delivering the message (command)
@@ -347,6 +344,9 @@ check_server(const char *name, struct Client *client_p)
 	rb_dlink_node *ptr;
 	int error = -1;
 	const char *encr;
+	bool name_matched = false;
+	bool host_matched = false;
+	bool certfp_failed = false;
 
 	s_assert(NULL != client_p);
 	if(client_p == NULL)
@@ -360,6 +360,8 @@ check_server(const char *name, struct Client *client_p)
 
 	RB_DLINK_FOREACH(ptr, server_conf_list.head)
 	{
+		struct rb_sockaddr_storage client_addr;
+
 		tmp_p = ptr->data;
 
 		if(ServerConfIllegal(tmp_p))
@@ -368,14 +370,23 @@ check_server(const char *name, struct Client *client_p)
 		if(!match(tmp_p->name, name))
 			continue;
 
-		error = -3;
+		name_matched = true;
 
-		/* XXX: Fix me for IPv6 */
-		/* XXX sockhost is the IPv4 ip as a string */
-		if(match(tmp_p->host, client_p->host) ||
-		   match(tmp_p->host, client_p->sockhost))
+		if(rb_inet_pton_sock(client_p->sockhost, (struct sockaddr *)&client_addr) <= 0)
+			SET_SS_FAMILY(&client_addr, AF_UNSPEC);
+
+		if((tmp_p->connect_host && match(tmp_p->connect_host, client_p->host))
+			|| (GET_SS_FAMILY(&client_addr) == GET_SS_FAMILY(&tmp_p->connect4)
+				&& comp_with_mask_sock((struct sockaddr *)&client_addr,
+					(struct sockaddr *)&tmp_p->connect4, 32))
+#ifdef RB_IPV6
+			|| (GET_SS_FAMILY(&client_addr) == GET_SS_FAMILY(&tmp_p->connect6)
+				&& comp_with_mask_sock((struct sockaddr *)&client_addr,
+					(struct sockaddr *)&tmp_p->connect6, 128))
+#endif
+			)
 		{
-			error = -2;
+			host_matched = true;
 
 			if(tmp_p->passwd)
 			{
@@ -397,8 +408,10 @@ check_server(const char *name, struct Client *client_p)
 
 			if(tmp_p->certfp)
 			{
-				if(!client_p->certfp || strcasecmp(tmp_p->certfp, client_p->certfp) != 0)
+				if(!client_p->certfp || rb_strcasecmp(tmp_p->certfp, client_p->certfp) != 0) {
+					certfp_failed = true;
 					continue;
+				}
 			}
 
 			server_p = tmp_p;
@@ -407,13 +420,28 @@ check_server(const char *name, struct Client *client_p)
 	}
 
 	if(server_p == NULL)
+	{
+		/* return the most specific error */
+		if(certfp_failed)
+			error = -6;
+		else if(host_matched)
+			error = -2;
+		else if(name_matched)
+			error = -3;
+
 		return error;
+	}
 
 	if(ServerConfSSL(server_p) && client_p->localClient->ssl_ctl == NULL)
 	{
 		return -5;
 	}
 
+	if (client_p->localClient->att_sconf && client_p->localClient->att_sconf->class == server_p->class) {
+		/* this is an outgoing connection that is already attached to the correct class */
+	} else if (CurrUsers(server_p->class) >= MaxUsers(server_p->class)) {
+		return -7;
+	}
 	attach_server_conf(client_p, server_p);
 
 	/* clear ZIP/TB if they support but we dont want them */
@@ -531,7 +559,7 @@ burst_modes_TS6(struct Client *client_p, struct Channel *chptr,
 		tlen = strlen(banptr->banstr) + (banptr->forward ? strlen(banptr->forward) + 1 : 0) + 1;
 
 		/* uh oh */
-		if(cur_len + tlen > BUFSIZE - 3)
+		if(cur_len + tlen > EXT_BUFSIZE - 3)
 		{
 			/* the one we're trying to send doesnt fit at all! */
 			if(cur_len == mlen)
@@ -573,7 +601,7 @@ burst_modes_TS6(struct Client *client_p, struct Channel *chptr,
 static void
 burst_TS6(struct Client *client_p)
 {
-	char ubuf[BUFSIZE];
+	char ubuf[EXT_BUFSIZE];
 	struct Client *target_p;
 	struct Channel *chptr;
 	struct membership *msptr;
@@ -592,6 +620,9 @@ burst_TS6(struct Client *client_p)
 		target_p = ptr->data;
 
 		if(!IsPerson(target_p))
+			continue;
+
+		if(MyClient(target_p->from) && target_p->localClient->att_sconf != NULL && ServerConfNoExport(target_p->localClient->att_sconf))
 			continue;
 
 		send_umode(NULL, target_p, 0, ubuf);
@@ -667,7 +698,7 @@ burst_TS6(struct Client *client_p)
 			if(is_voiced(msptr))
 				tlen++;
 
-			if(cur_len + tlen >= BUFSIZE - 3)
+			if(cur_len + tlen >= EXT_BUFSIZE - 3)
 			{
 				*(t-1) = '\0';
 				sendto_one(client_p, "%s", buf);
@@ -733,7 +764,7 @@ burst_TS6(struct Client *client_p)
 const char *
 show_capabilities(struct Client *target_p)
 {
-	static char msgbuf[BUFSIZE];
+	static char msgbuf[EXT_BUFSIZE];
 
 	*msgbuf = '\0';
 
@@ -803,7 +834,7 @@ server_estab(struct Client *client_p)
 			   EmptyString(server_p->spasswd) ? "*" : server_p->spasswd, TS_CURRENT, me.id);
 
 		/* pass info to new server */
-		send_capabilities(client_p, default_server_capabs
+		send_capabilities(client_p, default_server_capabs | CAP_MASK
 				  | (ServerConfCompressed(server_p) ? CAP_ZIP_SUPPORTED : 0)
 				  | (ServerConfTb(server_p) ? CAP_TB : 0));
 
@@ -821,14 +852,13 @@ server_estab(struct Client *client_p)
 	{
 		start_zlib_session(client_p);
 	}
-	sendto_one(client_p, "SVINFO %d %d 0 :%ld", TS_CURRENT, TS_MIN, (long int)rb_current_time());
 
 	client_p->servptr = &me;
 
 	if(IsAnyDead(client_p))
 		return CLIENT_EXITED;
 
-	SetServer(client_p);
+	sendto_one(client_p, "SVINFO %d %d 0 :%ld", TS_CURRENT, TS_MIN, (long int)rb_current_time());
 
 	rb_dlinkAdd(client_p, &client_p->lnode, &me.serv->servers);
 	rb_dlinkMoveNode(&client_p->localClient->tnode, &unknown_list, &serv_list);
@@ -840,6 +870,7 @@ server_estab(struct Client *client_p)
 	add_to_client_hash(client_p->name, client_p);
 	/* doesnt duplicate client_p->serv if allocated this struct already */
 	make_server(client_p);
+	SetServer(client_p);
 
 	client_p->serv->caps = client_p->localClient->caps;
 
@@ -885,6 +916,9 @@ server_estab(struct Client *client_p)
 		target_p = ptr->data;
 
 		if(target_p == client_p)
+			continue;
+
+		if(target_p->localClient->att_sconf != NULL && ServerConfNoExport(target_p->localClient->att_sconf))
 			continue;
 
 		if(has_id(target_p) && has_id(client_p))
@@ -933,6 +967,10 @@ server_estab(struct Client *client_p)
 
 		/* target_p->from == target_p for target_p == client_p */
 		if(IsMe(target_p) || target_p->from == client_p)
+			continue;
+
+		/* don't distribute downstream leaves of servers that are no-export */
+		if(MyClient(target_p->from) && target_p->from->localClient->att_sconf != NULL && ServerConfNoExport(target_p->from->localClient->att_sconf))
 			continue;
 
 		/* presumption, if target has an id, so does its uplink */
@@ -995,7 +1033,8 @@ int
 serv_connect(struct server_conf *server_p, struct Client *by)
 {
 	struct Client *client_p;
-	struct rb_sockaddr_storage myipnum;
+	struct rb_sockaddr_storage sa_connect;
+	struct rb_sockaddr_storage sa_bind;
 	char note[HOSTLEN + 10];
 	rb_fde_t *F;
 
@@ -1003,8 +1042,42 @@ serv_connect(struct server_conf *server_p, struct Client *by)
 	if(server_p == NULL)
 		return 0;
 
+	SET_SS_FAMILY(&sa_connect, AF_UNSPEC);
+	SET_SS_FAMILY(&sa_bind, AF_UNSPEC);
+
+#ifdef RB_IPV6
+	if(server_p->aftype != AF_UNSPEC
+		&& GET_SS_FAMILY(&server_p->connect4) == AF_INET
+		&& GET_SS_FAMILY(&server_p->connect6) == AF_INET6)
+	{
+		if(rand() % 2 == 0)
+		{
+			sa_connect = server_p->connect4;
+			sa_bind = server_p->bind4;
+		}
+		else
+		{
+			sa_connect = server_p->connect6;
+			sa_bind = server_p->bind6;
+		}
+	}
+	else if(server_p->aftype == AF_INET || GET_SS_FAMILY(&server_p->connect4) == AF_INET)
+#endif
+	{
+		sa_connect = server_p->connect4;
+		sa_bind = server_p->bind4;
+	}
+#ifdef RB_IPV6
+	else if(server_p->aftype == AF_INET6 || GET_SS_FAMILY(&server_p->connect6) == AF_INET6)
+	{
+		sa_connect = server_p->connect6;
+		sa_bind = server_p->bind6;
+	}
+#endif
+
 	/* log */
-	rb_inet_ntop_sock((struct sockaddr *)&server_p->my_ipnum, buf, sizeof(buf));
+	buf[0] = 0;
+	rb_inet_ntop_sock((struct sockaddr *)&sa_connect, buf, sizeof(buf));
 	ilog(L_SERVER, "Connect to *[%s] @%s", server_p->name, buf);
 
 	/*
@@ -1021,8 +1094,23 @@ serv_connect(struct server_conf *server_p, struct Client *by)
 		return 0;
 	}
 
+	if (CurrUsers(server_p->class) >= MaxUsers(server_p->class)) {
+		sendto_realops_snomask(SNO_GENERAL, L_ALL,
+				     "No more connections allowed in class \"%s\" for server %s",
+				     server_p->class->class_name, server_p->name);
+		if(by && IsPerson(by) && !MyClient(by))
+			sendto_one_notice(by, ":No more connections allowed in class \"%s\" for server %s",
+				     server_p->class->class_name, server_p->name);
+		return 0;
+	}
+
 	/* create a socket for the server connection */
-	if((F = rb_socket(GET_SS_FAMILY(&server_p->my_ipnum), SOCK_STREAM, 0, NULL)) == NULL)
+	if(GET_SS_FAMILY(&sa_connect) == AF_UNSPEC)
+	{
+		ilog_error("unspecified socket address family");
+		return 0;
+	}
+	else if((F = rb_socket(GET_SS_FAMILY(&sa_connect), SOCK_STREAM, 0, NULL)) == NULL)
 	{
 		ilog_error("opening a stream socket");
 		return 0;
@@ -1037,16 +1125,14 @@ serv_connect(struct server_conf *server_p, struct Client *by)
 
 	/* Copy in the server, hostname, fd */
 	rb_strlcpy(client_p->name, server_p->name, sizeof(client_p->name));
-	rb_strlcpy(client_p->host, server_p->host, sizeof(client_p->host));
+	if(server_p->connect_host)
+		rb_strlcpy(client_p->host, server_p->connect_host, sizeof(client_p->host));
+	else
+		rb_strlcpy(client_p->host, buf, sizeof(client_p->host));
 	rb_strlcpy(client_p->sockhost, buf, sizeof(client_p->sockhost));
 	client_p->localClient->F = F;
 	/* shove the port number into the sockaddr */
-#ifdef RB_IPV6
-	if(GET_SS_FAMILY(&server_p->my_ipnum) == AF_INET6)
-		((struct sockaddr_in6 *)&server_p->my_ipnum)->sin6_port = htons(server_p->port);
-	else
-#endif
-		((struct sockaddr_in *)&server_p->my_ipnum)->sin_port = htons(server_p->port);
+	SET_SS_PORT(&sa_connect, htons(server_p->port));
 
 	/*
 	 * Set up the initial server evilness, ripped straight from
@@ -1074,65 +1160,28 @@ serv_connect(struct server_conf *server_p, struct Client *by)
 	 */
 	make_server(client_p);
 	if(by && IsClient(by))
-		strcpy(client_p->serv->by, by->name);
+		rb_strlcpy(client_p->serv->by, by->name, sizeof(client_p->serv->by));
 	else
 		strcpy(client_p->serv->by, "AutoConn.");
 
 	SetConnecting(client_p);
 	rb_dlinkAddTail(client_p, &client_p->node, &global_client_list);
 
-	if(ServerConfVhosted(server_p))
+	if(GET_SS_FAMILY(&sa_bind) == AF_UNSPEC)
 	{
-		memcpy(&myipnum, &server_p->my_ipnum, sizeof(myipnum));
-		((struct sockaddr_in *)&myipnum)->sin_port = 0;
-		SET_SS_FAMILY(&myipnum, GET_SS_FAMILY(&server_p->my_ipnum));
-
-	}
-	else if(GET_SS_FAMILY(&server_p->my_ipnum) == AF_INET && ServerInfo.specific_ipv4_vhost)
-	{
-		memcpy(&myipnum, &ServerInfo.ip, sizeof(myipnum));
-		((struct sockaddr_in *)&myipnum)->sin_port = 0;
-		SET_SS_FAMILY(&myipnum, AF_INET);
-		SET_SS_LEN(&myipnum, sizeof(struct sockaddr_in));
-	}
-
+		if(GET_SS_FAMILY(&sa_connect) == GET_SS_FAMILY(&ServerInfo.bind4))
+			sa_bind = ServerInfo.bind4;
 #ifdef RB_IPV6
-	else if((GET_SS_FAMILY(&server_p->my_ipnum) == AF_INET6) && ServerInfo.specific_ipv6_vhost)
-	{
-		memcpy(&myipnum, &ServerInfo.ip6, sizeof(myipnum));
-		((struct sockaddr_in6 *)&myipnum)->sin6_port = 0;
-		SET_SS_FAMILY(&myipnum, AF_INET6);
-		SET_SS_LEN(&myipnum, sizeof(struct sockaddr_in6));
-	}
+		if(GET_SS_FAMILY(&sa_connect) == GET_SS_FAMILY(&ServerInfo.bind6))
+			sa_bind = ServerInfo.bind6;
 #endif
-	else
-	{
-		if(ServerConfSSL(server_p))
-		{
-			rb_connect_tcp(client_p->localClient->F,
-				       (struct sockaddr *)&server_p->my_ipnum, NULL, 0,
-				       serv_connect_ssl_callback, client_p,
-				       ConfigFileEntry.connect_timeout);
-		}
-		else
-			rb_connect_tcp(client_p->localClient->F,
-				       (struct sockaddr *)&server_p->my_ipnum, NULL, 0,
-				       serv_connect_callback, client_p,
-				       ConfigFileEntry.connect_timeout);
-
-		return 1;
 	}
-	if(ServerConfSSL(server_p))
-		rb_connect_tcp(client_p->localClient->F, (struct sockaddr *)&server_p->my_ipnum,
-			       (struct sockaddr *)&myipnum,
-			       GET_SS_LEN(&myipnum), serv_connect_ssl_callback, client_p,
-			       ConfigFileEntry.connect_timeout);
-	else
-		rb_connect_tcp(client_p->localClient->F, (struct sockaddr *)&server_p->my_ipnum,
-			       (struct sockaddr *)&myipnum,
-			       GET_SS_LEN(&myipnum), serv_connect_callback, client_p,
-			       ConfigFileEntry.connect_timeout);
 
+	rb_connect_tcp(client_p->localClient->F,
+		(struct sockaddr *)&sa_connect,
+		GET_SS_FAMILY(&sa_bind) == AF_UNSPEC ? NULL : (struct sockaddr *)&sa_bind,
+		ServerConfSSL(server_p) ? serv_connect_ssl_callback : serv_connect_callback,
+		client_p, ConfigFileEntry.connect_timeout);
 	return 1;
 }
 
@@ -1156,15 +1205,22 @@ serv_connect_ssl_callback(rb_fde_t *F, int status, void *data)
 
 	}
 	client_p->localClient->F = xF[0];
+	client_p->localClient->ssl_callback = serv_connect_ssl_open_callback;
 
-	client_p->localClient->ssl_ctl = start_ssld_connect(F, xF[1], rb_get_fd(xF[0]));
+	client_p->localClient->ssl_ctl = start_ssld_connect(F, xF[1], connid_get(client_p));
 	if(!client_p->localClient->ssl_ctl)
 	{
 		serv_connect_callback(client_p->localClient->F, RB_ERROR, data);
 		return;
 	}
 	SetSSL(client_p);
-	serv_connect_callback(client_p->localClient->F, RB_OK, client_p);
+}
+
+static int
+serv_connect_ssl_open_callback(struct Client *client_p, int status)
+{
+	serv_connect_callback(client_p->localClient->F, status, client_p);
+	return 1; /* suppress default exit_client handler for status != RB_OK */
 }
 
 /*
@@ -1208,7 +1264,7 @@ serv_connect_callback(rb_fde_t *F, int status, void *data)
 		/* COMM_ERR_TIMEOUT wont have an errno associated with it,
 		 * the others will.. --fl
 		 */
-		if(status == RB_ERR_TIMEOUT)
+		if(status == RB_ERR_TIMEOUT || status == RB_ERROR_SSL)
 		{
 			sendto_realops_snomask(SNO_GENERAL, is_remote_connect(client_p) ? L_NETWIDE : L_ALL,
 					"Error connecting to %s[%s]: %s",
@@ -1246,6 +1302,18 @@ serv_connect_callback(rb_fde_t *F, int status, void *data)
 		return;
 	}
 
+	if(server_p->certfp && (!client_p->certfp || rb_strcasecmp(server_p->certfp, client_p->certfp) != 0))
+	{
+		sendto_realops_snomask(SNO_GENERAL, is_remote_connect(client_p) ? L_NETWIDE : L_ALL,
+		     "Connection to %s has invalid certificate fingerprint %s",
+		     client_p->name, client_p->certfp);
+		ilog(L_SERVER, "Access denied, invalid certificate fingerprint %s from %s",
+		     client_p->certfp, log_client_name(client_p, SHOW_IP));
+
+		exit_client(client_p, client_p, &me, "Invalid fingerprint.");
+		return;
+	}
+
 	/* Next, send the initial handshake */
 	SetHandshake(client_p);
 
@@ -1254,7 +1322,7 @@ serv_connect_callback(rb_fde_t *F, int status, void *data)
 		   EmptyString(server_p->spasswd) ? "*" : server_p->spasswd, TS_CURRENT, me.id);
 
 	/* pass my info to the new server */
-	send_capabilities(client_p, default_server_capabs
+	send_capabilities(client_p, default_server_capabs | CAP_MASK
 			  | (ServerConfCompressed(server_p) ? CAP_ZIP_SUPPORTED : 0)
 			  | (ServerConfTb(server_p) ? CAP_TB : 0));
 

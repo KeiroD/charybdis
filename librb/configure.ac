@@ -104,7 +104,7 @@ AC_TYPE_UID_T
 dnl Checks for header files.
 AC_HEADER_STDC
 
-AC_CHECK_HEADERS([crypt.h unistd.h sys/socket.h sys/stat.h sys/time.h time.h netinet/in.h arpa/inet.h errno.h sys/uio.h spawn.h sys/poll.h sys/epoll.h sys/select.h sys/devpoll.h sys/event.h port.h signal.h sys/signalfd.h sys/timerfd.h linux/tcp.h])
+AC_CHECK_HEADERS([crypt.h unistd.h sys/socket.h sys/stat.h sys/time.h time.h netinet/in.h netinet/tcp.h arpa/inet.h errno.h sys/uio.h spawn.h sys/poll.h sys/epoll.h sys/select.h sys/devpoll.h sys/event.h port.h signal.h sys/signalfd.h sys/timerfd.h])
 AC_HEADER_TIME
 
 dnl Networking Functions
@@ -211,7 +211,7 @@ AC_CHECK_TYPE([sa_family_t], [],
 
 
 dnl check for various functions...
-AC_CHECK_FUNCS([snprintf vsnprintf socketpair gettimeofday writev sendmsg gmtime_r strtok_r usleep posix_spawn getexecname strlcpy strlcat strnlen fstat signalfd select poll kevent port_create epoll_ctl arc4random getrusage timerfd_create])	
+AC_CHECK_FUNCS([snprintf vsnprintf socketpair gettimeofday writev sendmsg gmtime_r strtok_r usleep posix_spawn getexecname strlcpy strlcat strnlen strcasestr strcasecmp strncasecmp fstat signalfd select poll kevent port_create epoll_ctl arc4random getrusage timerfd_create])	
 
 AC_SEARCH_LIBS(dlinfo, dl, AC_DEFINE(HAVE_DLINFO, 1, [Define if you have dlinfo]))
 AC_SEARCH_LIBS(nanosleep, rt posix4, AC_DEFINE(HAVE_NANOSLEEP, 1, [Define if you have nanosleep]))
@@ -352,9 +352,9 @@ if test "$cf_enable_mbedtls" != no; then
 	save_LIBS="$LIBS"
 	LIBS="$LIBS $MBEDTLS_LIBS"
 	AC_CHECK_LIB(mbedtls, mbedtls_ssl_init, [
-		MBEDTLS_LIBS="$MBEDTLS_LIBS -lmbedtls -lmbedcrypto -lmbedx509"
+		MBEDTLS_LIBS="$MBEDTLS_LIBS -lmbedtls -lmbedx509 -lmbedcrypto"
 		cf_enable_mbedtls=yes
-	], [cf_enable_mbedtls=no], [-lmbedcrypto -lmbedx509])
+	], [cf_enable_mbedtls=no], [-lmbedx509 -lmbedcrypto])
 fi
 
 dnl GnuTLS support
@@ -546,6 +546,10 @@ if test "x$rb_netinet_in_h" = "xyes"; then
 	echo '#include <netinet/in.h>' >> $outfile
 fi
 
+if test "x$rb_netinet_tcp_h" == "xyes"; then
+	echo '#include <netinet/tcp.h>' >> $outfile
+fi
+
 if test "x$rb_arpa_inet_h" = "xyes"; then
 	echo '#include <arpa/inet.h>' >> $outfile
 fi
@@ -631,6 +635,9 @@ fi
 	fi
 	if test x$ac_cv_header_netinet_in_h = xyes; then
 		rb_netinet_in_h=yes
+	fi
+	if test x$ac_cv_header_netinet_tcp_h = xyes; then
+		rb_netinet_tcp_h=yes
 	fi
 
 	if test x$ac_cv_header_crypt_h = xyes; then

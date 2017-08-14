@@ -71,7 +71,7 @@ capability_put(struct CapabilityIndex *idx, const char *cap, void *ownerdata)
 	}
 
 	entry = rb_malloc(sizeof(struct CapabilityEntry));
-	entry->cap = cap;
+	entry->cap = rb_strdup(cap);
 	entry->flags = 0;
 	entry->value = idx->highest_bit;
 	entry->ownerdata = ownerdata;
@@ -133,7 +133,9 @@ capability_destroy(rb_dictionary_element *delem, void *privdata)
 {
 	s_assert(delem != NULL);
 
-	rb_free(delem->data);
+	struct CapabilityEntry *entry = delem->data;
+	rb_free((char *)entry->cap);
+	rb_free(entry);
 }
 
 struct CapabilityIndex *
@@ -143,7 +145,7 @@ capability_index_create(const char *name)
 
 	idx = rb_malloc(sizeof(struct CapabilityIndex));
 	idx->name = name;
-	idx->cap_dict = rb_dictionary_create(name, strcasecmp);
+	idx->cap_dict = rb_dictionary_create(name, rb_strcasecmp);
 	idx->highest_bit = 1;
 
 	rb_dlinkAdd(idx, &idx->node, &capability_indexes);

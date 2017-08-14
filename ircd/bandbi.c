@@ -46,6 +46,9 @@
 #include "msg.h"	/* XXX: MAXPARA */
 #include "operhash.h"
 
+static void
+bandb_handle_failure(rb_helper *helper, char **parv, int parc) __attribute__((noreturn));
+
 static char bandb_add_letter[LAST_BANDB_TYPE] = {
 	'K', 'D', 'X', 'R'
 };
@@ -397,12 +400,12 @@ static void
 bandb_parse(rb_helper *helper)
 {
 	static char buf[READBUF_SIZE];
-	char *parv[MAXPARA + 1];
+	char *parv[MAXPARA];
 	int len, parc;
 
 	while((len = rb_helper_read(helper, buf, sizeof(buf))))
 	{
-		parc = rb_string_to_array(buf, parv, MAXPARA);
+		parc = rb_string_to_array(buf, parv, sizeof(parv));
 
 		if(parc < 1)
 			continue;

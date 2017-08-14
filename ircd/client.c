@@ -32,7 +32,7 @@
 #include "ircd.h"
 #include "numeric.h"
 #include "packet.h"
-#include "s_auth.h"
+#include "authproc.h"
 #include "s_conf.h"
 #include "s_newconf.h"
 #include "logger.h"
@@ -47,11 +47,11 @@
 #include "hook.h"
 #include "msg.h"
 #include "monitor.h"
-#include "blacklist.h"
 #include "reject.h"
 #include "scache.h"
 #include "rb_dictionary.h"
 #include "sslproc.h"
+#include "wsproc.h"
 #include "s_assert.h"
 
 #define DEBUG_EXITED_CLIENTS
@@ -76,7 +76,7 @@ static rb_bh *pclient_heap = NULL;
 static rb_bh *user_heap = NULL;
 static rb_bh *away_heap = NULL;
 static char current_uid[IDLEN];
-static int32_t current_connid = 0;
+static uint32_t current_connid = 0;
 
 rb_dictionary *nd_dict = NULL;
 
@@ -129,6 +129,80 @@ init_client(void)
 	nd_dict = rb_dictionary_create("nickdelay", irccmp);
 }
 
+/*
+ * connid_get - allocate a connid
+ *
+ * inputs       - none
+ * outputs      - a connid token which is used to represent a logical circuit
+ * side effects - current_connid is incremented, possibly multiple times.
+ *                the association of the connid to it's client is committed.
+ */
+uint32_t
+connid_get(struct Client *client_p)
+{
+	s_assert(MyConnect(client_p));
+	if (!MyConnect(client_p))
+		return 0;
+
+	/* find a connid that is available */
+	while (find_cli_connid_hash(++current_connid) != NULL)
+	{
+		/* handle wraparound, current_connid must NEVER be 0 */
+		if (current_connid == 0)
+			++current_connid;
+	}
+
+	add_to_cli_connid_hash(client_p, current_connid);
+	rb_dlinkAddAlloc(RB_UINT_TO_POINTER(current_connid), &client_p->localClient->connids);
+
+	return current_connid;
+}
+
+/*
+ * connid_put - free a connid
+ *
+ * inputs       - connid to free
+ * outputs      - nothing
+ * side effects - connid bookkeeping structures are freed
+ */
+void
+connid_put(uint32_t id)
+{
+	struct Client *client_p;
+
+	s_assert(id != 0);
+	if (id == 0)
+		return;
+
+	client_p = find_cli_connid_hash(id);
+	if (client_p == NULL)
+		return;
+
+	del_from_cli_connid_hash(id);
+	rb_dlinkFindDestroy(RB_UINT_TO_POINTER(id), &client_p->localClient->connids);
+}
+
+/*
+ * client_release_connids - release any connids still attached to a client
+ *
+ * inputs       - client to garbage collect
+ * outputs      - none
+ * side effects - client's connids are garbage collected
+ */
+void
+client_release_connids(struct Client *client_p)
+{
+	rb_dlink_node *ptr, *ptr2;
+
+	if (client_p->localClient->connids.head)
+		s_assert(MyConnect(client_p));
+
+	if (!MyConnect(client_p))
+		return;
+
+	RB_DLINK_FOREACH_SAFE(ptr, ptr2, client_p->localClient->connids.head)
+		connid_put(RB_POINTER_TO_UINT(ptr->data));
+}
 
 /*
  * make_client - create a new Client struct and set it to initial state.
@@ -160,17 +234,6 @@ make_client(struct Client *from)
 
 		client_p->localClient->F = NULL;
 
-		if(current_connid+1 == 0)
-			current_connid++;
-
-		client_p->localClient->connid = ++current_connid;
-
-		if(current_connid+1 == 0)
-			current_connid++;
-
-		client_p->localClient->zconnid = ++current_connid;
-		add_to_cli_connid_hash(client_p);
-
 		client_p->preClient = rb_bh_alloc(pclient_heap);
 
 		/* as good a place as any... */
@@ -184,7 +247,7 @@ make_client(struct Client *from)
 	}
 
 	SetUnknown(client_p);
-	strcpy(client_p->username, "unknown");
+	rb_strlcpy(client_p->username, "unknown", sizeof(client_p->username));
 
 	return client_p;
 }
@@ -192,17 +255,15 @@ make_client(struct Client *from)
 void
 free_pre_client(struct Client *client_p)
 {
-	struct Blacklist *blptr;
-
 	s_assert(NULL != client_p);
 
 	if(client_p->preClient == NULL)
 		return;
 
-	blptr = client_p->preClient->dnsbl_listed;
-	if (blptr != NULL)
-		unref_blacklist(blptr);
-	s_assert(rb_dlink_list_length(&client_p->preClient->dnsbl_queries) == 0);
+	s_assert(client_p->preClient->auth.cid == 0);
+
+	rb_free(client_p->preClient->auth.data);
+	rb_free(client_p->preClient->auth.reason);
 
 	rb_bh_free(pclient_heap, client_p->preClient);
 	client_p->preClient = NULL;
@@ -229,7 +290,7 @@ free_local_client(struct Client *client_p)
 		client_p->localClient->listener = 0;
 	}
 
-	del_from_cli_connid_hash(client_p);
+	client_release_connids(client_p);
 	if(client_p->localClient->F != NULL)
 	{
 		rb_close(client_p->localClient->F);
@@ -250,17 +311,24 @@ free_local_client(struct Client *client_p)
 	if (client_p->localClient->privset)
 		privilegeset_unref(client_p->localClient->privset);
 
-	if(IsSSL(client_p))
-	    ssld_decrement_clicount(client_p->localClient->ssl_ctl);
+	if (IsSSL(client_p))
+		ssld_decrement_clicount(client_p->localClient->ssl_ctl);
 
-	if(IsCapable(client_p, CAP_ZIP))
-	    ssld_decrement_clicount(client_p->localClient->z_ctl);
+	rb_free(client_p->localClient->cipher_string);
+
+	if (IsCapable(client_p, CAP_ZIP))
+		ssld_decrement_clicount(client_p->localClient->z_ctl);
+
+	rb_free(client_p->localClient->zipstats);
+
+	if (client_p->localClient->ws_ctl != NULL)
+		wsockd_decrement_clicount(client_p->localClient->ws_ctl);
 
 	rb_bh_free(lclient_heap, client_p->localClient);
 	client_p->localClient = NULL;
 }
 
-void
+static void
 free_client(struct Client *client_p)
 {
 	s_assert(NULL != client_p);
@@ -393,9 +461,8 @@ check_unknowns_list(rb_dlink_list * list)
 		if(IsDead(client_p) || IsClosing(client_p))
 			continue;
 
-		/* still has DNSbls to validate against */
-		if(client_p->preClient != NULL &&
-				rb_dlink_list_length(&client_p->preClient->dnsbl_queries) > 0)
+		/* Still querying with authd */
+		if(client_p->preClient != NULL && client_p->preClient->auth.cid != 0)
 			continue;
 
 		/*
@@ -1016,9 +1083,9 @@ free_exited_clients(void *unused)
 				{
 					s_assert(0);
 					sendto_realops_snomask(SNO_GENERAL, L_ALL,
-						"On abort_list: %s stat: %u flags: %u/%u handler: %c",
+						"On abort_list: %s stat: %u flags: %llu handler: %c",
 						target_p->name, (unsigned int) target_p->status,
-						target_p->flags, target_p->flags2, target_p->handler);
+						(unsigned long long)target_p->flags,  target_p->handler);
 					sendto_realops_snomask(SNO_GENERAL, L_ALL,
 						"Please report this to the charybdis developers!");
 					found++;
@@ -1160,9 +1227,9 @@ exit_aborted_clients(void *unused)
 			{
 				s_assert(0);
 				sendto_realops_snomask(SNO_GENERAL, L_ALL,
-					"On dead_list: %s stat: %u flags: %u/%u handler: %c",
+					"On dead_list: %s stat: %u flags: %llu handler: %c",
 					abt->client->name, (unsigned int) abt->client->status,
-					abt->client->flags, abt->client->flags2, abt->client->handler);
+					(unsigned long long)abt->client->flags, abt->client->handler);
 				sendto_realops_snomask(SNO_GENERAL, L_ALL,
 					"Please report this to the charybdis developers!");
 				continue;
@@ -1291,11 +1358,18 @@ exit_remote_client(struct Client *client_p, struct Client *source_p, struct Clie
  */
 
 static int
-exit_unknown_client(struct Client *client_p, struct Client *source_p, struct Client *from,
-		  const char *comment)
+exit_unknown_client(struct Client *client_p, /* The local client originating the
+                                              * exit or NULL, if this exit is
+                                              * generated by this server for
+                                              * internal reasons.
+                                              * This will not get any of the
+                                              * generated messages. */
+		struct Client *source_p,     /* Client exiting */
+		struct Client *from,         /* Client firing off this Exit,
+                                              * never NULL! */
+		const char *comment)
 {
-	delete_auth_queries(source_p);
-	abort_blacklist_queries(source_p);
+	authd_abort_client(source_p);
 	rb_dlinkDelete(&source_p->localClient->tnode, &unknown_list);
 
 	if(!IsIOError(source_p))
@@ -1338,13 +1412,9 @@ exit_remote_server(struct Client *client_p, struct Client *source_p, struct Clie
 		snprintf(newcomment, sizeof(newcomment), "by %s: %s",
 				from->name, comment);
 
-	if(source_p->serv != NULL)
-		remove_dependents(client_p, source_p, from, IsPerson(from) ? newcomment : comment, comment1);
+	remove_dependents(client_p, source_p, from, IsPerson(from) ? newcomment : comment, comment1);
 
-	if(source_p->servptr && source_p->servptr->serv)
-		rb_dlinkDelete(&source_p->lnode, &source_p->servptr->serv->servers);
-	else
-		s_assert(0);
+	rb_dlinkDelete(&source_p->lnode, &source_p->servptr->serv->servers);
 
 	rb_dlinkFindDestroy(source_p, &global_serv_list);
 	target_p = source_p->from;
@@ -1362,6 +1432,7 @@ exit_remote_server(struct Client *client_p, struct Client *source_p, struct Clie
 
 	del_from_client_hash(source_p->name, source_p);
 	remove_client_from_list(source_p);
+
 	scache_split(source_p->serv->nameinfo);
 
 	SetDead(source_p);
@@ -1949,7 +2020,7 @@ close_connection(struct Client *client_p)
 	else
 		ServerStats.is_ni++;
 
-	del_from_cli_connid_hash(client_p);
+	client_release_connids(client_p);
 
 	if(client_p->localClient->F != NULL)
 	{

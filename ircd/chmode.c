@@ -253,7 +253,7 @@ add_id(struct Client *source_p, struct Channel *chptr, const char *banid, const 
 	 */
 	if(MyClient(source_p))
 	{
-		if((rb_dlink_list_length(&chptr->banlist) + rb_dlink_list_length(&chptr->exceptlist) + rb_dlink_list_length(&chptr->invexlist) + rb_dlink_list_length(&chptr->quietlist)) >= (unsigned long)(chptr->mode.mode & MODE_EXLIMIT ? ConfigChannel.max_bans_large : ConfigChannel.max_bans))
+		if((rb_dlink_list_length(&chptr->banlist) + rb_dlink_list_length(&chptr->exceptlist) + rb_dlink_list_length(&chptr->invexlist) + rb_dlink_list_length(&chptr->quietlist)) >= (unsigned long)((chptr->mode.mode & MODE_EXLIMIT) ? ConfigChannel.max_bans_large : ConfigChannel.max_bans))
 		{
 			sendto_one(source_p, form_str(ERR_BANLISTFULL),
 				   me.name, source_p->name, chptr->chname, realban);
@@ -291,7 +291,7 @@ add_id(struct Client *source_p, struct Channel *chptr, const char *banid, const 
 
 	/* invalidate the can_send() cache */
 	if(mode_type == CHFL_BAN || mode_type == CHFL_QUIET || mode_type == CHFL_EXCEPTION)
-		chptr->bants++;
+		chptr->bants = rb_current_time();
 
 	return true;
 }
@@ -321,7 +321,7 @@ del_id(struct Channel *chptr, const char *banid, rb_dlink_list * list, long mode
 
 			/* invalidate the can_send() cache */
 			if(mode_type == CHFL_BAN || mode_type == CHFL_QUIET || mode_type == CHFL_EXCEPTION)
-				chptr->bants++;
+				chptr->bants = rb_current_time();
 
 			return banptr;
 		}
@@ -490,7 +490,7 @@ static bool
 check_forward(struct Client *source_p, struct Channel *chptr,
 		const char *forward)
 {
-	struct Channel *targptr;
+	struct Channel *targptr = NULL;
 	struct membership *msptr;
 
 	if(!check_channel_name(forward) ||
@@ -822,7 +822,6 @@ chm_ban(struct Client *source_p, struct Channel *chptr,
 	default:
 		sendto_realops_snomask(SNO_GENERAL, L_ALL, "chm_ban() called with unknown type!");
 		return;
-		break;
 	}
 
 	if(dir == 0 || parc <= *parn)
@@ -1779,8 +1778,8 @@ set_channel_mode(struct Client *client_p, struct Client *source_p,
 				*mbuf = '\0';
 
 				if(cur_len > mlen)
-					sendto_channel_local(flags, chptr, "%s %s", modebuf,
-							     parabuf);
+					sendto_channel_local(IsServer(source_p) ? fakesource_p : source_p,
+							flags, chptr, "%s %s", modebuf, parabuf);
 				else
 					continue;
 
@@ -1816,7 +1815,8 @@ set_channel_mode(struct Client *client_p, struct Client *source_p,
 
 		*mbuf = '\0';
 		if(cur_len > mlen)
-			sendto_channel_local(flags, chptr, "%s %s", modebuf, parabuf);
+			sendto_channel_local(IsServer(source_p) ? fakesource_p : source_p,
+				flags, chptr, "%s %s", modebuf, parabuf);
 	}
 
 	/* only propagate modes originating locally, or if we're hubbing */

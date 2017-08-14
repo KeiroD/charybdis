@@ -7,7 +7,7 @@ AM_CPPFLAGS = @LTDLINCL@ -I$(top_srcdir)/include -I$(top_srcdir)/librb/include
 AM_LDFLAGS  = -L$(top_srcdir)/librb/src -export-dynamic -avoid-version -no-undefined
 AM_YFLAGS = -d
 
-BUILT_SOURCES = version.c
+BUILT_SOURCES = ircd_parser.h version.c
 
 version.c: version.c.SH ../CREDITS ../include/patchlevel.h ../include/serno.h
 	$(SHELL) version.c.SH
@@ -19,9 +19,8 @@ EXTRA_FLAGS = -Wl,--enable-runtime-pseudo-reloc -export-symbols-regex '*'
 endif
 
 libircd_la_SOURCES =                  \
-  authd.c			\
+  authproc.c			\
   bandbi.c                      \
-  blacklist.c                   \
   cache.c                       \
   capability.c			\
   channel.c                     \
@@ -34,7 +33,6 @@ libircd_la_SOURCES =                  \
   hash.c                        \
   hook.c                        \
   hostmask.c                    \
-  ipv4_from_ipv6.c		\
   ircd.c                        \
   ircd_parser.y                 \
   ircd_lexer.l                  \
@@ -53,7 +51,6 @@ libircd_la_SOURCES =                  \
   ratelimit.c			\
   reject.c                      \
   restart.c                     \
-  s_auth.c                      \
   s_conf.c                      \
   s_newconf.c                   \
   s_serv.c                      \
@@ -66,7 +63,8 @@ libircd_la_SOURCES =                  \
   supported.c                   \
   tgchange.c                    \
   version.c                     \
-  whowas.c
+  whowas.c			\
+  wsproc.c
 libircd_la_LDFLAGS = $(EXTRA_FLAGS) -avoid-version -no-undefined
 libircd_la_LIBADD = @LIBLTDL@ -L$(top_srcdir)/librb/src -lrb
 libircd_LTLIBRARIES = libircd.la

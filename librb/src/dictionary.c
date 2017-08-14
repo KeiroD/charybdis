@@ -138,7 +138,6 @@ rb_dictionary_get_linear_index(rb_dictionary *dict, const void *key)
 	rb_dictionary_element *elem;
 
 	lrb_assert(dict != NULL);
-	lrb_assert(key != NULL);
 
 	elem = rb_dictionary_find(dict, key);
 	if (elem == NULL)
@@ -273,7 +272,7 @@ rb_dictionary_retune(rb_dictionary *dict, const void *key)
  * Side Effects:
  *     - a node is linked to the dictionary tree
  */
-static void
+static rb_dictionary_element *
 rb_dictionary_link(rb_dictionary *dict,
 	rb_dictionary_element *delem)
 {
@@ -335,8 +334,11 @@ rb_dictionary_link(rb_dictionary *dict,
 			dict->count--;
 
 			rb_free(delem);
+			delem = dict->root;
 		}
 	}
+
+	return delem;
 }
 
 /*
@@ -648,7 +650,6 @@ void rb_dictionary_foreach_next(rb_dictionary *dtree,
 rb_dictionary_element *rb_dictionary_find(rb_dictionary *dict, const void *key)
 {
 	lrb_assert(dict != NULL);
-	lrb_assert(key != NULL);
 
 	/* retune for key, key will be the tree's root if it's available */
 	rb_dictionary_retune(dict, key);
@@ -681,7 +682,6 @@ rb_dictionary_element *rb_dictionary_add(rb_dictionary *dict, const void *key, v
 	rb_dictionary_element *delem;
 
 	lrb_assert(dict != NULL);
-	lrb_assert(key != NULL);
 	lrb_assert(data != NULL);
 	lrb_assert(rb_dictionary_find(dict, key) == NULL);
 
@@ -689,9 +689,7 @@ rb_dictionary_element *rb_dictionary_add(rb_dictionary *dict, const void *key, v
 	delem->key = key;
 	delem->data = data;
 
-	rb_dictionary_link(dict, delem);
-
-	return delem;
+	return rb_dictionary_link(dict, delem);
 }
 
 /*
@@ -704,14 +702,14 @@ rb_dictionary_element *rb_dictionary_add(rb_dictionary *dict, const void *key, v
  *     - name of DTree node to delete
  *
  * Outputs:
- *     - on success, the remaining data that needs to be mowgli_freed
+ *     - on success, the remaining data that needs to be rb_freed
  *     - on failure, NULL
  *
  * Side Effects:
  *     - data is removed from the DTree.
  *
  * Notes:
- *     - the returned data needs to be mowgli_freed/released manually!
+ *     - the returned data needs to be rb_freed/released manually!
  */
 void *rb_dictionary_delete(rb_dictionary *dtree, const void *key)
 {
@@ -819,7 +817,7 @@ void rb_dictionary_stats(rb_dictionary *dict, void (*cb)(const char *line, void 
 	{
 		maxdepth = 0;
 		sum = stats_recurse(dict->root, 0, &maxdepth);
-		snprintf(str, sizeof str, "%-30s %-15s %-10d %-10d %-10d %-10d", dict->id, "DICT", dict->count, sum, sum / dict->count, maxdepth);
+		snprintf(str, sizeof str, "%-30s %-15s %-10u %-10d %-10d %-10d", dict->id, "DICT", dict->count, sum, sum / dict->count, maxdepth);
 	}
 	else
 	{

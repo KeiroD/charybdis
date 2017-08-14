@@ -74,42 +74,43 @@ struct ConfItem
 	rb_patricia_node_t *pnode;	/* Our patricia node */
 };
 
-#define CONF_ILLEGAL            0x80000000
-#define CONF_CLIENT             0x0002
-#define CONF_KILL               0x0040
+#define CONF_ILLEGAL		0x80000000
+#define CONF_CLIENT		0x0002
+#define CONF_KILL		0x0040
 #define CONF_XLINE		0x0080
 #define CONF_RESV_CHANNEL	0x0100
 #define CONF_RESV_NICK		0x0200
 #define CONF_RESV		(CONF_RESV_CHANNEL | CONF_RESV_NICK)
 
-#define CONF_DLINE             0x20000
-#define CONF_EXEMPTDLINE      0x100000
+#define CONF_DLINE		0x020000
+#define CONF_EXEMPTDLINE	0x100000
 
 #define IsIllegal(x)    ((x)->status & CONF_ILLEGAL)
 
 /* aConfItem->flags */
 
 /* Generic flags... */
-#define CONF_FLAGS_TEMPORARY            0x00800000
+#define CONF_FLAGS_TEMPORARY		0x00800000
 #define CONF_FLAGS_NEED_SSL		0x00000002
-#define CONF_FLAGS_MYOPER		0x00080000 /* need to rewrite info.oper on burst */
+#define CONF_FLAGS_MYOPER		0x00080000	/* need to rewrite info.oper on burst */
 /* auth{} flags... */
-#define CONF_FLAGS_NO_TILDE             0x00000004
-#define CONF_FLAGS_NEED_IDENTD          0x00000008
-#define CONF_FLAGS_EXEMPTKLINE          0x00000040
-#define CONF_FLAGS_NOLIMIT              0x00000080
-#define CONF_FLAGS_SPOOF_IP             0x00000200
+#define CONF_FLAGS_NO_TILDE		0x00000004
+#define CONF_FLAGS_NEED_IDENTD		0x00000008
+#define CONF_FLAGS_EXEMPTKLINE		0x00000040
+#define CONF_FLAGS_NOLIMIT		0x00000080
+#define CONF_FLAGS_SPOOF_IP		0x00000200
 #define CONF_FLAGS_SPOOF_NOTICE		0x00000400
-#define CONF_FLAGS_REDIR                0x00000800
+#define CONF_FLAGS_REDIR		0x00000800
 #define CONF_FLAGS_EXEMPTRESV		0x00002000	/* exempt from resvs */
-#define CONF_FLAGS_EXEMPTFLOOD          0x00004000
+#define CONF_FLAGS_EXEMPTFLOOD		0x00004000
 #define CONF_FLAGS_EXEMPTSPAMBOT	0x00008000
 #define CONF_FLAGS_EXEMPTSHIDE		0x00010000
 #define CONF_FLAGS_EXEMPTJUPE		0x00020000	/* exempt from resv generating warnings */
 #define CONF_FLAGS_NEED_SASL		0x00040000
 #define CONF_FLAGS_EXTEND_CHANS		0x00080000
-#define CONF_FLAGS_ENCRYPTED            0x00200000
+#define CONF_FLAGS_ENCRYPTED		0x00200000
 #define CONF_FLAGS_EXEMPTDNSBL		0x04000000
+#define CONF_FLAGS_EXEMPTPROXY		0x08000000
 
 
 /* Macros for struct ConfItem */
@@ -130,6 +131,7 @@ struct ConfItem
 #define IsConfEncrypted(x)      ((x)->flags & CONF_FLAGS_ENCRYPTED)
 #define IsNeedSasl(x)		((x)->flags & CONF_FLAGS_NEED_SASL)
 #define IsConfExemptDNSBL(x)	((x)->flags & CONF_FLAGS_EXEMPTDNSBL)
+#define IsConfExemptProxy(x)	((x)->flags & CONF_FLAGS_EXEMPTPROXY)
 #define IsConfExtendChans(x)	((x)->flags & CONF_FLAGS_EXTEND_CHANS)
 #define IsConfSSLNeeded(x)	((x)->flags & CONF_FLAGS_NEED_SSL)
 
@@ -280,14 +282,10 @@ struct server_info
 	char *description;
 	char *network_name;
 	int hub;
-	struct sockaddr_in ip;
+	struct rb_sockaddr_storage bind4;
 	int default_max_clients;
 #ifdef RB_IPV6
-	struct sockaddr_in6 ip6;
-#endif
-	int specific_ipv4_vhost;
-#ifdef RB_IPV6
-	int specific_ipv6_vhost;
+	struct rb_sockaddr_storage bind6;
 #endif
 	char *ssl_private_key;
 	char *ssl_ca_cert;
@@ -295,6 +293,7 @@ struct server_info
 	char *ssl_dh_params;
 	char *ssl_cipher_list;
 	int ssld_count;
+	int wsockd_count;
 };
 
 struct admin_info
@@ -309,12 +308,9 @@ struct alias_entry
 	char *name;
 	char *target;
 	int flags;			/* reserved for later use */
-	int hits;
 };
 
 /* All variables are GLOBAL */
-extern int specific_ipv4_vhost;	/* used in s_bsd.c */
-extern int specific_ipv6_vhost;
 extern struct config_file_entry ConfigFileEntry;	/* defined in ircd.c */
 extern struct config_channel_entry ConfigChannel;	/* defined in channel.c */
 extern struct config_server_hide ConfigServerHide;	/* defined in s_conf.c */

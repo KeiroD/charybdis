@@ -79,6 +79,9 @@ static void perform_nick_collides(struct Client *, struct Client *,
 static void perform_nickchange_collides(struct Client *, struct Client *,
 					struct Client *, int, const char **, time_t, const char *);
 
+static int h_local_nick_change;
+static int h_remote_nick_change;
+
 struct Message nick_msgtab = {
 	"NICK", 0, 0, 0, 0,
 	{{mr_nick, 0}, {m_nick, 0}, {mc_nick, 3}, {ms_nick, 0}, mg_ignore, {m_nick, 0}}
@@ -99,10 +102,16 @@ struct Message save_msgtab = {
 mapi_clist_av1 nick_clist[] = { &nick_msgtab, &uid_msgtab, &euid_msgtab,
 	&save_msgtab, NULL };
 
+mapi_hlist_av1 nick_hlist[] = {
+	{ "local_nick_change", &h_local_nick_change },
+	{ "remote_nick_change", &h_remote_nick_change },
+	{ NULL, NULL }
+};
+
 static const char nick_desc[] =
 	"Provides the NICK client and server commands as well as the UID, EUID, and SAVE TS6 server commands";
 
-DECLARE_MODULE_AV2(nick, NULL, NULL, nick_clist, NULL, NULL, NULL, NULL, nick_desc);
+DECLARE_MODULE_AV2(nick, NULL, NULL, nick_clist, nick_hlist, NULL, NULL, NULL, nick_desc);
 
 /* mr_nick()
  *       parv[1] = nickname
@@ -155,7 +164,7 @@ mr_nick(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *source_
 	if((target_p = find_named_client(nick)) == NULL)
 		set_initial_nick(client_p, source_p, nick);
 	else if(source_p == target_p)
-		strcpy(source_p->name, nick);
+		rb_strlcpy(source_p->name, nick, sizeof(source_p->name));
 	else
 		sendto_one(source_p, form_str(ERR_NICKNAMEINUSE), me.name, "*", nick);
 }
@@ -593,7 +602,7 @@ set_initial_nick(struct Client *client_p, struct Client *source_p, char *nick)
 	if(source_p->name[0])
 		del_from_client_hash(source_p->name, source_p);
 
-	strcpy(source_p->name, nick);
+	rb_strlcpy(source_p->name, nick, sizeof(source_p->name));
 	add_to_client_hash(nick, source_p);
 
 	snprintf(note, sizeof(note), "Nick: %s", nick);
@@ -615,6 +624,7 @@ change_local_nick(struct Client *client_p, struct Client *source_p,
 	struct Channel *chptr;
 	char note[NICKLEN + 10];
 	int samenick;
+	hook_cdata hook_info;
 
 	if (dosend)
 	{
@@ -658,6 +668,11 @@ change_local_nick(struct Client *client_p, struct Client *source_p,
 			invalidate_bancache_user(source_p);
 	}
 
+	hook_info.client = source_p;
+	hook_info.arg1 = source_p->name;
+	hook_info.arg2 = nick;
+	call_hook(h_local_nick_change, &hook_info);
+
 	sendto_realops_snomask(SNO_NCHANGE, L_ALL,
 			     "Nick change: From %s to %s [%s@%s]",
 			     source_p->name, nick, source_p->username, source_p->host);
@@ -680,7 +695,7 @@ change_local_nick(struct Client *client_p, struct Client *source_p,
 
 	/* Finally, add to hash */
 	del_from_client_hash(source_p->name, source_p);
-	strcpy(source_p->name, nick);
+	rb_strlcpy(source_p->name, nick, sizeof(source_p->name));
 	add_to_client_hash(nick, source_p);
 
 	if(!samenick)
@@ -716,6 +731,7 @@ change_remote_nick(struct Client *client_p, struct Client *source_p,
 {
 	struct nd_entry *nd;
 	int samenick = irccmp(source_p->name, nick) ? 0 : 1;
+	hook_cdata hook_info;
 
 	/* client changing their nick - dont reset ts if its same */
 	if(!samenick)
@@ -723,6 +739,11 @@ change_remote_nick(struct Client *client_p, struct Client *source_p,
 		source_p->tsinfo = newts ? newts : rb_current_time();
 		monitor_signoff(source_p);
 	}
+
+	hook_info.client = source_p;
+	hook_info.arg1 = source_p->name;
+	hook_info.arg2 = nick;
+	call_hook(h_remote_nick_change, &hook_info);
 
 	sendto_common_channels_local(source_p, NOCAPS, NOCAPS, ":%s!%s@%s NICK :%s",
 				     source_p->name, source_p->username, source_p->host, nick);
@@ -743,7 +764,7 @@ change_remote_nick(struct Client *client_p, struct Client *source_p,
 	if((nd = rb_dictionary_retrieve(nd_dict, nick)))
 		free_nd_entry(nd);
 
-	strcpy(source_p->name, nick);
+	rb_strlcpy(source_p->name, nick, sizeof(source_p->name));
 	add_to_client_hash(nick, source_p);
 
 	if(!samenick)
@@ -1023,7 +1044,7 @@ register_client(struct Client *client_p, struct Client *server,
 	source_p->hopcount = atoi(parv[2]);
 	source_p->tsinfo = newts;
 
-	strcpy(source_p->name, nick);
+	rb_strlcpy(source_p->name, nick, sizeof(source_p->name));
 	rb_strlcpy(source_p->username, parv[5], sizeof(source_p->username));
 	rb_strlcpy(source_p->host, parv[6], sizeof(source_p->host));
 	rb_strlcpy(source_p->orighost, source_p->host, sizeof(source_p->orighost));

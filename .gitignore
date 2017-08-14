@@ -1,6 +1,7 @@
 tags
 Makefile
 *~
+*.a
 *.o
 *.so
 *.lo
@@ -17,6 +18,7 @@ bandb/bantool
 autom4te.cache
 aclocal.m4
 compile
+confdefs.h
 config.guess
 config.sub
 depcomp
@@ -34,6 +36,7 @@ librb/aclocal.m4
 librb/include/librb_config.h
 librb/include/librb_config.h.in
 librb/include/librb-config.h
+librb/include/serno.h
 librb/librb.pc
 librb/ltmain.sh
 librb/missing
@@ -52,7 +55,25 @@ ircd/ircd_lexer.c
 ircd/version.c
 ircd/version.c.last
 ssld/ssld
+wsockd/wsockd
+tests/core
+tests/msgbuf_parse1
+tests/msgbuf_unparse1
+tests/rb_dictionary1
+tests/rb_snprintf_append1
+tests/rb_snprintf_try_append1
+tests/send1
+tests/substitution1
+tests/runtests
+tests/*.c.ban.db
+tests/*.c.ban.db-journal
+tests/*.c.log
+tests/*.c.pid
+!tests/runtime/modules/*.so
+!tests/runtime/modules/autoload/*.so
+testsuite/ircd.pid.*
 tools/charybdis-mkpasswd
+tools/charybdis-mkfingerprint
 tools/genssl
 tools/mkpasswd
 tools/viconf
@@ -71,3 +92,4 @@ m4/ltsugar.m4
 m4/ltversion.m4
 m4/lt~obsolete.m4
 *.dSYM/
+*.exe

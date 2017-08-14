@@ -30,16 +30,14 @@
 #ifndef __TOOLS_H__
 #define __TOOLS_H__
 
+int rb_strcasecmp(const char *s1, const char *s2);
+int rb_strncasecmp(const char *s1, const char *s2, size_t n);
+char *rb_strcasestr(const char *s, const char *find);
 size_t rb_strlcpy(char *dst, const char *src, size_t siz);
 size_t rb_strlcat(char *dst, const char *src, size_t siz);
 size_t rb_strnlen(const char *s, size_t count);
-
-#ifdef __GNUC__
-int rb_snprintf_append(char *str, size_t len, const char *format, ...)
-	__attribute__ ((format(printf, 3, 4)));
-#else
-int rb_snprintf_append(char *str, const size_t size, const char *, ...);
-#endif
+int rb_snprintf_append(char *str, size_t len, const char *format, ...) AFP(3,4);
+int rb_snprintf_try_append(char *str, size_t len, const char *format, ...) AFP(3,4);
 
 char *rb_basename(const char *);
 char *rb_dirname(const char *);
@@ -351,25 +349,24 @@ rb_dlinkMoveList(rb_dlink_list *from, rb_dlink_list *to)
 	from->length = 0;
 }
 
-typedef struct _rb_zstring
-{
-	uint16_t len; /* big enough */
-	uint16_t alloclen;
-	uint8_t *data;
-} rb_zstring_t;
 
-size_t rb_zstring_serialized(rb_zstring_t *zs, void **buf, size_t *buflen);
-size_t rb_zstring_deserialize(rb_zstring_t *zs, void *buf);
-void rb_zstring_free(rb_zstring_t *zs);
-rb_zstring_t *rb_zstring_alloc(void);
-rb_zstring_t *rb_zstring_from_c_len(const char *buf, size_t len);
-rb_zstring_t *rb_zstring_from_c(const char *buf);
-size_t rb_zstring_len(rb_zstring_t *zs);
-void rb_zstring_append_from_zstring(rb_zstring_t *dst_zs, rb_zstring_t *src_zs);
-void rb_zstring_append_from_c(rb_zstring_t *zs, const char *buf, size_t len);
-char *rb_zstring_to_c(rb_zstring_t *zs, char *buf, size_t len);
-char *rb_zstring_to_c_alloc(rb_zstring_t *zs);
-size_t rb_zstring_to_ptr(rb_zstring_t *zs, void **ptr);
+typedef int (*rb_strf_func_t)(char *buf, size_t len, void *args);
+
+typedef struct _rb_strf {
+	size_t length;			/* length limit to apply to this string (and following strings if their length is 0) */
+	const char *format;		/* string or format string */
+	rb_strf_func_t func;		/* function to print to string */
+	union {
+		va_list *format_args;	/* non-NULL if this is a format string */
+		void *func_args;	/* args for a function */
+	};
+	const struct _rb_strf *next;	/* next string to append */
+} rb_strf_t;
+
+int rb_fsnprint(char *buf, size_t len, const rb_strf_t *strings);
+int rb_fsnprintf(char *buf, size_t len, const rb_strf_t *strings, const char *format, ...) AFP(4, 5);
+
+
 const char *rb_path_to_self(void);
 
 #endif /* __TOOLS_H__ */

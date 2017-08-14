@@ -40,7 +40,6 @@
 #include "rb_radixtree.h"
 
 rb_dictionary *client_connid_tree = NULL;
-rb_dictionary *client_zconnid_tree = NULL;
 rb_radixtree *client_id_tree = NULL;
 rb_radixtree *client_name_tree = NULL;
 
@@ -60,7 +59,6 @@ void
 init_hash(void)
 {
 	client_connid_tree = rb_dictionary_create("client connid", rb_uint32cmp);
-	client_zconnid_tree = rb_dictionary_create("client zconnid", rb_uint32cmp);
 	client_id_tree = rb_radixtree_create("client id", NULL);
 	client_name_tree = rb_radixtree_create("client name", irccasecanon);
 
@@ -407,7 +405,7 @@ find_channel(const char *name)
  *  block, if it didn't exist before).
  */
 struct Channel *
-get_or_create_channel(struct Client *client_p, const char *chname, int *isnew)
+get_or_create_channel(struct Client *client_p, const char *chname, bool *isnew)
 {
 	struct Channel *chptr;
 	int len;
@@ -428,7 +426,7 @@ get_or_create_channel(struct Client *client_p, const char *chname, int *isnew)
 		}
 		len = CHANNELLEN;
 		t = LOCAL_COPY(s);
-		*(t + CHANNELLEN) = '\0';
+		t[len] = '\0';
 		s = t;
 	}
 
@@ -436,12 +434,12 @@ get_or_create_channel(struct Client *client_p, const char *chname, int *isnew)
 	if (chptr != NULL)
 	{
 		if (isnew != NULL)
-			*isnew = 0;
+			*isnew = false;
 		return chptr;
 	}
 
 	if(isnew != NULL)
-		*isnew = 1;
+		*isnew = true;
 
 	chptr = allocate_channel(s);
 	chptr->channelts = rb_current_time();	/* doesn't hurt to set it here */
@@ -493,41 +491,19 @@ clear_resv_hash(void)
 }
 
 void
-add_to_zconnid_hash(struct Client *client_p)
+add_to_cli_connid_hash(struct Client *client_p, uint32_t id)
 {
-	rb_dictionary_add(client_zconnid_tree, RB_UINT_TO_POINTER(client_p->localClient->zconnid), client_p);
+	rb_dictionary_add(client_connid_tree, RB_UINT_TO_POINTER(id), client_p);
 }
 
 void
-del_from_zconnid_hash(struct Client *client_p)
+del_from_cli_connid_hash(uint32_t id)
 {
-	rb_dictionary_delete(client_zconnid_tree, RB_UINT_TO_POINTER(client_p->localClient->zconnid));
-}
-
-void
-add_to_cli_connid_hash(struct Client *client_p)
-{
-	rb_dictionary_add(client_connid_tree, RB_UINT_TO_POINTER(client_p->localClient->connid), client_p);
-}
-
-void
-del_from_cli_connid_hash(struct Client *client_p)
-{
-	rb_dictionary_delete(client_connid_tree, RB_UINT_TO_POINTER(client_p->localClient->connid));
+	rb_dictionary_delete(client_connid_tree, RB_UINT_TO_POINTER(id));
 }
 
 struct Client *
 find_cli_connid_hash(uint32_t connid)
 {
-	struct Client *target_p;
-
-	target_p = rb_dictionary_retrieve(client_connid_tree, RB_UINT_TO_POINTER(connid));
-	if (target_p != NULL)
-		return target_p;
-
-	target_p = rb_dictionary_retrieve(client_zconnid_tree, RB_UINT_TO_POINTER(connid));
-	if (target_p != NULL)
-		return target_p;
-
-	return NULL;
+	return rb_dictionary_retrieve(client_connid_tree, RB_UINT_TO_POINTER(connid));
 }
